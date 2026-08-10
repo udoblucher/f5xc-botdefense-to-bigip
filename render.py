@@ -15,12 +15,28 @@ THE DESIGN BEING GENERATED
 XC Bot Defense in REVERSE_PROXY mode is a service the BIG-IP steers traffic
 into; the BIG-IP does not evaluate bot policy itself. Two independent jobs:
 
-  Steering (LTM policy, first-match)
-      rule 1  path contains <js data-group>                  -> bot pool
-      rule 2+ method + no shape-header + path <op> <dg>      -> bot pool
+  Steering (LTM policy, first-match -- the order IS the logic)
+      rule 0  path contains <js data-group>                  -> bot pool
+      rule 1  shape-header exists AND source in <egress dg>  -> no action
+      rule 2+ method + path <op> <dg>                        -> bot pool,
+                                                               fallback app pool
       no match                                               -> VS default pool
-    The shape-header condition is what stops a loop: it marks a request Bot
-    Defense has already inspected and handed back, so it must go to the app.
+
+    Rule 0 first and unconditional: the telemetry script is always served by the
+    Bot Defense service. That path is terminated by the service rather than
+    proxied to the origin, so it never comes back as return traffic.
+
+    Rule 1 is the loop guard, and it only has to precede the endpoint rules.
+    "Steer to the bot pool unless the request is from an egress address AND
+    carries the header" is a NAND, and an LTM rule can only AND its conditions,
+    so the positive case is matched here and stopped. Carrying no action,
+    first-match ends evaluation and the request proceeds to the VS's own pool.
+
+    Both halves of rule 1 matter. The shape-header alone is a value any client
+    can set, so a header-only guard lets a crafted request skip Bot Defense
+    entirely; pairing it with the service's egress addresses closes that. When
+    the infra advertises no egress addresses we fall back to testing the header
+    on each endpoint rule instead, and say so.
 
   Injection (HTML profile + iRule)
       The telemetry <script> is injected into the <head> of responses, but only
@@ -65,8 +81,10 @@ def names_for(prefix: str) -> dict:
         "irule":        f"{p}-irule",
         "html_rule":    f"{p}-js-rule",
         "html_profile": f"{p}-js-profile",
+        "oneconnect":   f"{p}-oneconnect",
         "dg_js":        f"{p}-js",
         "dg_entry":     f"{p}-entrypoint",
+        "dg_egress":    f"{p}-egress",
         "dg_ep_prefix": f"{p}-endpoints",
     }
 
@@ -232,7 +250,8 @@ when HTTP_RESPONSE priority 500 {{
 def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
                prefix: str = "bot-defense", shape_header: str = "shape-header",
                partition: str = "Common", inject_tag: str = "head",
-               merge_op: str = "") -> dict:
+               merge_op: str = "",
+               oneconnect_mask: str = "255.255.255.255") -> dict:
     """Every decision that turns XC data + operator answers into objects.
 
     `default_pool` is optional and feeds exactly one property: the per-rule
@@ -254,12 +273,28 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
     buckets, warnings = _endpoint_buckets(inputs, n["dg_ep_prefix"], merge_op)
     entry = _entrypoint_records(inputs)
 
-    datagroups = [{
+    # Bot Defense's egress addresses, from the infra object. These are what make
+    # the return-traffic rule trustworthy: the shape-header alone is a value any
+    # client can set, so a header-only test is a bypass waiting to happen.
+    egress = [ip if "/" in ip else f"{ip}/32"
+              for ip in (svc.get("egress_ips") or [])]
+
+    datagroups = []
+    if egress:
+        datagroups.append({
+            "name": n["dg_egress"],
+            "type": "ip",
+            "purpose": "Bot Defense egress addresses. Combined with the "
+                       f"{shape_header} header, these identify traffic Bot "
+                       "Defense has already inspected and is handing back.",
+            "records": [(ip, "") for ip in egress],
+        })
+    datagroups.append({
         "name": n["dg_js"],
         "purpose": "Path of the Bot Defense telemetry JavaScript. Requests for "
                    "it are served by the Bot Defense service, not the app.",
         "records": [(js["match_path"], "")],
-    }]
+    })
     if entry:
         datagroups.append({
             "name": n["dg_entry"],
@@ -278,9 +313,20 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
             "sources": b["sources"],
         })
 
+    # Order is the logic here -- the strategy is first-match.
+    #
+    #   0  JS path                -> bot pool, unconditionally
+    #   1  return traffic         -> no action, falls through to the app
+    #   2+ protected endpoints    -> bot pool, fallback to the app pool
+    #
+    # The JS rule is FIRST so the telemetry script is always served by the Bot
+    # Defense service, whatever else is true of the request. Bot Defense
+    # terminates that path itself rather than proxying it to the origin, so it
+    # never arrives as return traffic and cannot loop.
     rules = [{
         "name": n["dg_js"],
-        "why": "Serve the telemetry JS from the Bot Defense service.",
+        "why": "Serve the telemetry JS from the Bot Defense service. First, and "
+               "with no other condition, so it is served regardless.",
         # Case-insensitive on purpose: the JS path is generated by XC and the
         # browser echoes it verbatim, but a case-folding proxy in between
         # should not be able to knock the telemetry request off its route.
@@ -289,11 +335,34 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
         "pool": n["pool"],
         "fallback": "",
     }]
+    if egress:
+        # Must come BEFORE the endpoint rules. "Steer to the bot pool unless the
+        # request is from an egress address AND carries the header" is a NAND,
+        # and an LTM rule can only AND its conditions -- so the positive case is
+        # matched here and stopped. Carrying no action, first-match ends
+        # evaluation and the request proceeds to the VS's own pool: no pool name
+        # needed, and no way back into the bot pool.
+        rules.append({
+            "name": f"{prefix.rstrip('-')}-return",
+            "why": f"Traffic Bot Defense already inspected and handed back "
+                   f"-- it carries {shape_header} AND comes from an address in "
+                   f"{n['dg_egress']}. Both halves are needed: the header alone "
+                   f"is something any client could set.",
+            "conditions": [
+                {"kind": "header-exists", "name": shape_header},
+                {"kind": "src-ip", "dg": n["dg_egress"], "negate": False},
+            ],
+            "pool": "",
+            "fallback": "",
+        })
     for b in buckets:
         conds = []
         if b["method"] != "ANY":
             conds.append({"kind": "method", "values": [b["method"]]})
-        conds.append({"kind": "header-absent", "name": shape_header})
+        if not egress:
+            # No egress list to check, so the header is all there is to go on.
+            # Weaker: a client that sets the header itself skips Bot Defense.
+            conds.append({"kind": "header-absent", "name": shape_header})
         conds.append({"kind": "path", "op": b["op"], "dg": b["dg"],
                       "nocase": b["nocase"], "negate": b["negate"]})
         rules.append({
@@ -313,6 +382,13 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
                 f"{b['op']}, which is true of every path: ALL {b['method']} "
                 f"traffic now goes to the bot pool, static assets included. "
                 f"Drop that record, or match it with ends-with instead.")
+    if not egress:
+        warnings.append(
+            f"The infra advertises no egress addresses, so return traffic is "
+            f"recognised by the {shape_header} header alone. That header is a "
+            f"value any client can set, so a crafted request carrying it will "
+            f"skip Bot Defense. Check the Bot Infrastructure in XC and re-run "
+            f"fetch to pick the addresses up.")
     if not entry:
         warnings.append(
             "The policy has no GET_DOCUMENT endpoint, so no entrypoint was "
@@ -371,6 +447,12 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
                       "content": f"<script src=\"{js['script_src']}\"></script>"},
         "html_profile": {"name": n["html_profile"], "rule": n["html_rule"],
                          "content_selection": ["text/html", "text/xhtml"]},
+        # Serverside connection reuse, restricted to one client address. The
+        # stock profile's `source-mask any` lets unrelated clients share a
+        # serverside connection, which hides the real source from the origin;
+        # a /32 mask keeps reuse within a single client.
+        "oneconnect": ({"name": n["oneconnect"], "source_mask": oneconnect_mask}
+                       if oneconnect_mask else None),
         "irule": {"name": n["irule"], "text": ""},
         "policy": {"name": n["policy"], "strategy": "first-match", "rules": rules},
         "egress_ips": svc.get("egress_ips", []),
@@ -388,6 +470,12 @@ def _cond_english(c: dict) -> str:
         return f"HTTP Method **is** `{'`, `'.join(c['values'])}`"
     if c["kind"] == "header-absent":
         return f"HTTP Header `{c['name']}` **does not exist**"
+    if c["kind"] == "header-exists":
+        return f"HTTP Header `{c['name']}` **exists**"
+    if c["kind"] == "src-ip":
+        neg = "does not match" if c.get("negate") else "matches"
+        return (f"TCP *Address* (client) **{neg}** any address in data group "
+                f"`{c['dg']}`")
     neg = "does not " if c["negate"] else ""
     ci = " (case-insensitive)" if c["nocase"] else ""
     return f"HTTP URI *path* {neg}**{c['op']}** any value in data group `{c['dg']}`{ci}"
@@ -510,6 +598,25 @@ def render_ui(plan: dict) -> str:
     A(f"| Available Rules → Selected | `{plan['html_profile']['rule']}` |")
     A("")
 
+    if plan["oneconnect"]:
+        step += 1
+        oc = plan["oneconnect"]
+        A(f"## Step {step} — OneConnect profile")
+        A("")
+        A("**Local Traffic ›› Profiles ›› Other ›› OneConnect ›› Create**")
+        A("")
+        A("| Field | Value |")
+        A("|---|---|")
+        A(f"| Name | `{oc['name']}` |")
+        A("| Parent Profile | `oneconnect` |")
+        A(f"| Source Mask | `{oc['source_mask']}` |")
+        A("")
+        A("The stock profile uses `source-mask any`, which lets unrelated "
+          "clients share one serverside connection — the origin then cannot "
+          "tell them apart by source address. A `/32` mask confines reuse to a "
+          "single client. Everything else is left at the parent's defaults.")
+        A("")
+
     step += 1
     A(f"## Step {step} — iRule")
     A("")
@@ -543,6 +650,12 @@ def render_ui(plan: dict) -> str:
         A("- Conditions (all must match):")
         for c in r["conditions"]:
             A(f"    - {_cond_english(c)}")
+        if not r["pool"]:
+            A("- Action: **none** — leave the Actions list empty. Under "
+              "first-match the rule still matches and stops evaluation, so the "
+              f"request goes to `{plan['vs']}`'s own pool.")
+            A("")
+            continue
         fb = ""
         if r["fallback"] == FALLBACK_TOKEN:
             fb = (f", *Fallback Pool* the pool already on `{plan['vs']}` "
@@ -566,11 +679,18 @@ def render_ui(plan: dict) -> str:
     A(f"**Local Traffic ›› Virtual Servers ›› Virtual Server List ›› "
       f"{plan['vs']}**")
     A("")
-    A("1. **Properties** tab, set the view to **Advanced**: set **HTML Profile** "
-      f"to `{plan['html_profile']['name']}`. Update.")
-    A(f"2. **Resources** tab: under **Policies**, click **Manage…** and move "
+    nth = 1
+    A(f"{nth}. **Properties** tab, set the view to **Advanced**: set **HTML "
+      f"Profile** to `{plan['html_profile']['name']}`. Update.")
+    if plan["oneconnect"]:
+        nth += 1
+        A(f"{nth}. **Properties** tab (Advanced): set **OneConnect Profile** to "
+          f"`{plan['oneconnect']['name']}`. Update.")
+    nth += 1
+    A(f"{nth}. **Resources** tab: under **Policies**, click **Manage…** and move "
       f"`{plan['policy']['name']}` into *Enabled*.")
-    A(f"3. **Resources** tab: under **iRules**, click **Manage…** and move "
+    nth += 1
+    A(f"{nth}. **Resources** tab: under **iRules**, click **Manage…** and move "
       f"`{plan['irule']['name']}` into *Enabled*. Order matters only if you have "
       f"other iRules touching `HTML::` or the response.")
     A("")
@@ -629,11 +749,22 @@ def _tmsh_conditions(rule: dict, indent: str) -> list[str]:
         if c["kind"] == "method":
             lines.append(f"{indent}    http-method")
             lines.append(f"{indent}    values {{ {' '.join(c['values'])} }}")
-        elif c["kind"] == "header-absent":
+        elif c["kind"] in ("header-absent", "header-exists"):
             lines.append(f"{indent}    http-header")
             lines.append(f"{indent}    name {c['name']}")
-            lines.append(f"{indent}    not")
+            if c["kind"] == "header-absent":
+                lines.append(f"{indent}    not")
             lines.append(f"{indent}    exists")
+        elif c["kind"] == "src-ip":
+            # Client address. The event is left at the default: tmsh normalizes
+            # anything else to client-accepted here, and the address is the same
+            # value at every event anyway.
+            lines.append(f"{indent}    tcp")
+            lines.append(f"{indent}    address")
+            if c.get("negate"):
+                lines.append(f"{indent}    not")
+            lines.append(f"{indent}    matches")
+            lines.append(f"{indent}    datagroup {c['dg']}")
         else:
             lines.append(f"{indent}    http-uri")
             lines.append(f"{indent}    path")
@@ -652,9 +783,12 @@ def _tmsh_conditions(rule: dict, indent: str) -> list[str]:
 
 def _policy_block(plan: dict) -> str:
     p = plan["policy"]
+    # A tcp condition makes the policy require the tcp module as well as http.
+    needs_tcp = any(c["kind"] == "src-ip"
+                    for r in p["rules"] for c in r["conditions"])
     L = [f"ltm policy {p['name']} {{",
          "    controls { forwarding }",
-         "    requires { http }",
+         "    requires { http tcp }" if needs_tcp else "    requires { http }",
          f"    strategy {p['strategy']}",
          "    rules {"]
     for ordinal, r in enumerate(p["rules"]):
@@ -663,15 +797,18 @@ def _policy_block(plan: dict) -> str:
         L.append("            conditions {")
         L += _tmsh_conditions(r, "                ")
         L.append("            }")
-        L.append("            actions {")
-        L.append("                0 {")
-        L.append("                    forward")
-        L.append("                    select")
-        if r["fallback"]:
-            L.append(f"                    fallback-pool {r['fallback']}")
-        L.append(f"                    pool {r['pool']}")
-        L.append("                }")
-        L.append("            }")
+        # No pool means no action: under first-match the rule still matches and
+        # stops evaluation, so the request falls through to the VS's own pool.
+        if r["pool"]:
+            L.append("            actions {")
+            L.append("                0 {")
+            L.append("                    forward")
+            L.append("                    select")
+            if r["fallback"]:
+                L.append(f"                    fallback-pool {r['fallback']}")
+            L.append(f"                    pool {r['pool']}")
+            L.append("                }")
+            L.append("            }")
         L.append("        }")
     L += ["    }", "}"]
     return "\n".join(L)
@@ -710,7 +847,7 @@ def render_tmsh(plan: dict) -> str:
     A('trap "rm -rf $TMP" EXIT')
     A("")
 
-    step, total = 1, 9
+    step, total = 1, 10 if plan["oneconnect"] else 9
 
     A(f'echo "== STEP {step}/{total} -- health monitor {plan["monitor"]["name"]} =="')
     mon = plan["monitor"]
@@ -733,7 +870,8 @@ def render_tmsh(plan: dict) -> str:
     A(f"#   tmsh modify ltm data-group internal {n['dg_js']} records add {{ /path {{ }} }}")
     for dg in plan["datagroups"]:
         A(f"#  {dg['name']}: {dg['purpose']}")
-        A(f"tmsh -c 'create ltm data-group internal {dg['name']} type string "
+        A(f"tmsh -c 'create ltm data-group internal {dg['name']} "
+          f"type {dg.get('type', 'string')} "
           f"records add {{ {_tmsh_records(dg['records'])} }}'")
     A("")
 
@@ -762,6 +900,17 @@ def render_tmsh(plan: dict) -> str:
       f"content-selection add {{ {' '.join(hp['content_selection'])} }} "
       f"rules add {{ {hp['rule']} }}'")
     A("")
+
+    if plan["oneconnect"]:
+        step += 1
+        oc = plan["oneconnect"]
+        A(f'echo "== STEP {step}/{total} -- OneConnect profile {oc["name"]} =="')
+        A("# Serverside connection reuse. The stock profile's `source-mask any`")
+        A("# lets unrelated clients share a serverside connection; a /32 mask")
+        A("# keeps reuse within one client address.")
+        A(f"tmsh -c 'create ltm profile one-connect {oc['name']} "
+          f"defaults-from oneconnect source-mask {oc['source_mask']}'")
+        A("")
 
     step += 1
     A(f'echo "== STEP {step}/{total} -- iRule {plan["irule"]["name"]} =="')
@@ -809,8 +958,11 @@ def render_tmsh(plan: dict) -> str:
     A(f"EXISTING=$(tmsh -c 'list ltm virtual {plan['vs']} rules one-line' "
       f"| sed -n 's/.*rules {{\\([^}}]*\\)}}.*/\\1/p')")
     A(f'echo "  existing iRules on {plan["vs"]}: ${{EXISTING:-<none>}}"')
+    profiles = [plan["html_profile"]["name"]]
+    if plan["oneconnect"]:
+        profiles.append(plan["oneconnect"]["name"])
     A(f"tmsh -c 'modify ltm virtual {plan['vs']} profiles add "
-      f"{{ {plan['html_profile']['name']} }}'")
+      f"{{ {' '.join(profiles)} }}'")
     A(f"tmsh -c 'modify ltm virtual {plan['vs']} policies add "
       f"{{ {plan['policy']['name']} }}'")
     A(f'case " $EXISTING " in')
@@ -840,6 +992,8 @@ def render_tmsh(plan: dict) -> str:
     A(f"#   tmsh delete ltm policy {plan['policy']['name']}")
     A(f"#   tmsh delete ltm rule {plan['irule']['name']}")
     A(f"#   tmsh delete ltm profile html {plan['html_profile']['name']}")
+    if plan["oneconnect"]:
+        A(f"#   tmsh delete ltm profile one-connect {plan['oneconnect']['name']}")
     A(f"#   tmsh delete ltm html-rule tag-append-html {plan['html_rule']['name']}")
     for dg in plan["datagroups"]:
         A(f"#   tmsh delete ltm data-group internal {dg['name']}")
@@ -861,9 +1015,16 @@ def _as3_conditions(rule: dict) -> list[dict]:
         if c["kind"] == "method":
             out.append({"type": "httpMethod", "event": "request",
                         "all": {"operand": "equals", "values": c["values"]}})
-        elif c["kind"] == "header-absent":
+        elif c["kind"] in ("header-absent", "header-exists"):
+            op = "does-not-exist" if c["kind"] == "header-absent" else "exists"
             out.append({"type": "httpHeader", "event": "request",
-                        "name": c["name"], "all": {"operand": "does-not-exist"}})
+                        "name": c["name"], "all": {"operand": op}})
+        elif c["kind"] == "src-ip":
+            out.append({"type": "tcp", "event": "request",
+                        "address": {
+                            "operand": "does-not-match" if c.get("negate")
+                                       else "matches",
+                            "datagroup": {"use": c["dg"]}}})
         else:
             op = _OP_AS3_NEG[c["op"]] if c["negate"] else c["op"]
             out.append({"type": "httpUri", "event": "request",
@@ -900,7 +1061,7 @@ def render_as3(plan: dict) -> str:
     for dg in plan["datagroups"]:
         app[dg["name"]] = {
             "class": "Data_Group", "storageType": "internal",
-            "keyDataType": "string",
+            "keyDataType": dg.get("type", "string"),
             "remark": dg["purpose"][:64],
             "records": [{"key": k, "value": v} for k, v in dg["records"]],
         }
@@ -914,17 +1075,26 @@ def render_as3(plan: dict) -> str:
         "contentSelection": plan["html_profile"]["content_selection"],
         "rules": [{"use": n["html_rule"]}],
     }
+    if plan["oneconnect"]:
+        app[n["oneconnect"]] = {
+            "class": "Multiplex_Profile",
+            "sourceMask": plan["oneconnect"]["source_mask"],
+        }
     app[n["irule"]] = {
         "class": "iRule", "expand": False, "iRule": plan["irule"]["text"],
     }
     app[n["policy"]] = {
         "class": "Endpoint_Policy",
         "strategy": plan["policy"]["strategy"],
+        # An empty actions list is deliberate for the return-traffic rule: it
+        # must match and stop evaluation WITHOUT forwarding, or it would send
+        # Bot Defense's own return traffic straight back into the bot pool.
         "rules": [{
             "name": r["name"],
             "conditions": _as3_conditions(r),
-            "actions": [{"type": "forward", "event": "request",
-                         "select": {"pool": {"use": n["pool"]}}}],
+            "actions": ([{"type": "forward", "event": "request",
+                          "select": {"pool": {"use": r["pool"]}}}]
+                        if r["pool"] else []),
         } for r in plan["policy"]["rules"]],
     }
 

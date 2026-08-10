@@ -63,17 +63,69 @@ XC Bot Defense in `REVERSE_PROXY` mode is a service the BIG-IP **steers traffic
 into**. The BIG-IP does not evaluate bot policy itself. That splits into two
 independent jobs, which is why there is both a policy and an iRule.
 
-**Steering** — an LTM policy, `first-match`:
+**Steering** — an LTM policy with the `first-match` strategy, so the order *is*
+the logic:
 
-| # | Condition | Action |
-|---|---|---|
-| 0 | path contains a value in the JS data group | → bot pool |
-| 1+ | method + `shape-header` absent + path *op* a value in an endpoint data group | → bot pool (fallback: app pool) |
-| — | nothing matched | → the VS's own pool |
+| # | Rule | Conditions | Action |
+|---|---|---|---|
+| 0 | `…-js` | path contains a value in the JS data group | → bot pool |
+| 1 | `…-return` | `shape-header` exists **and** client address in the egress data group | *none* |
+| 2+ | `…-endpoints-*` | method + path *op* a value in an endpoint data group | → bot pool (fallback: app pool) |
+| — | | nothing matched | → the VS's own pool |
 
-The `shape-header` condition is the loop guard. Bot Defense sets that header on
-requests it has already inspected and is handing back; without the condition
-those would be sent straight back into the bot pool.
+#### Rule 0 — serve the telemetry JS, always
+
+First and with no other condition, so the script is served by the Bot Defense
+service whatever else is true of the request. The service terminates that path
+itself rather than proxying it to the origin, so it never comes back as return
+traffic and cannot loop.
+
+#### Rule 1 — the loop guard
+
+In `REVERSE_PROXY` mode Bot Defense is not a sidecar returning a verdict; it
+forwards the real request on to its configured origin, **which is this same
+virtual server**. So the BIG-IP sees every protected request twice. Rule 1 is
+what tells the two visits apart, and it must precede the endpoint rules — remove
+it and each protected endpoint loops between the BIG-IP and Bot Defense forever.
+
+What you want is *"steer to the bot pool unless the request comes from an egress
+address **and** carries the header"* — a NAND. An LTM rule can only AND its
+conditions, so the positive case is matched here and stopped instead.
+
+Both halves matter. `shape-header` is just a header and any client can set one,
+so a header-only guard means a crafted request skips Bot Defense entirely.
+Requiring an egress address too closes that: forging the header is not enough,
+you would also have to originate from Bot Defense's network. The addresses come
+from the Bot Infrastructure object (`spec.cloud_hosted.egress[].ip_address`) and
+land in an `ip`-type data group. If the infra advertises none, the tool falls
+back to testing `shape-header` absence on each endpoint rule and warns that the
+guard is weaker.
+
+The rule carries **no action**, which is how "let it through to the application"
+is expressed: under `first-match` it matches, evaluation ends, and the request
+proceeds to the virtual server's own pool.
+
+That is worth stating precisely, because an action-less rule could plausibly
+mean "no match, keep evaluating" — which would drop return traffic into the
+endpoint rules and loop. It does not. Verified on 17.5.1 with two rules that
+both matched one request: the action-less rule won on ordinal, the second rule
+never ran, and the request was still load-balanced, to the VS's own pool. An
+empty action list means *make no forwarding decision*, leaving the virtual
+server's normal routing intact.
+
+Naming the pool explicitly would read better but is not worth the cost: left
+out, the pool lives in exactly one place — the virtual server — so repointing
+the VS carries the return path with it instead of leaving a stale reference that
+quietly routes to the old origin.
+
+#### Rules 2+ — the protected endpoints
+
+One rule per endpoint data group, each forwarding to the bot pool with the app
+pool as its `fallback-pool`. They carry no `shape-header` condition of their own —
+rule 1 already handled return traffic, and testing the header here as well would
+be the spoofable form of the same check. See
+[Why one data group per method *and operator*](#objects-created) below for how
+the groups are formed.
 
 **You do not specify the fallback pool.** It is the only thing the VS's own pool
 name is needed for, and the VS already knows it, so the generated script reads
@@ -105,11 +157,13 @@ With the default `--prefix bot-defense`:
 |---|---|---|
 | `ltm monitor https` | `bot-defense-hc` | the service's own `/sedcloudapi/health` |
 | `ltm pool` | `bot-defense-pool` | infra `cloud_hosted.infra_host_name`, as an auto-populating FQDN member |
+| `ltm data-group` (`ip`) | `bot-defense-egress` | infra `cloud_hosted.egress[].ip_address` |
 | `ltm data-group` | `bot-defense-js` | `js_download_path`, query stripped |
 | `ltm data-group` | `bot-defense-entrypoint` | `GET_DOCUMENT` endpoints; value holds the methods |
 | `ltm data-group` | `bot-defense-endpoints-<method>-<op>[-ci][-not]` | protected endpoint paths |
 | `ltm html-rule` | `bot-defense-js-rule` | `js_download_path`, query kept |
 | `ltm profile html` | `bot-defense-js-profile` | — |
+| `ltm profile one-connect` | `bot-defense-oneconnect` | `--oneconnect-mask`, default `255.255.255.255` |
 | `ltm rule` | `bot-defense-irule` | — |
 | `ltm policy` | `bot-defense-policy` | endpoint methods and match operators |
 
@@ -142,6 +196,31 @@ longer says what XC says:
 Left alone, the default reproduces XC faithfully. Reach for `--merge-ops` when
 you would rather curate one list per method by hand than track what XC says.
 
+### OneConnect
+
+A OneConnect profile is created with `source-mask 255.255.255.255` and attached
+alongside the HTML profile. The stock `oneconnect` profile ships with
+`source-mask any`, which lets *unrelated clients* share one serverside
+connection — the origin then cannot tell them apart by source address. A `/32`
+mask confines reuse to a single client address. Everything else inherits from
+the parent. `--oneconnect-mask ""` skips the profile entirely.
+
+Two interactions with the rest of this config are worth knowing, both benign:
+
+- **Rule 1's source-IP test is unaffected.** OneConnect multiplexes the
+  *serverside* only. The clientside connection is one per client and its source
+  address is constant for the connection's life, so `tcp address` resolves the
+  same way for every request on a keep-alive. Bot Defense's return traffic
+  arrives on its own connections from egress addresses either way.
+- **`SERVER_CONNECTED` stops firing per request, and that is correct here.**
+  With OneConnect it fires only when a new serverside connection opens. The
+  iRule uses that event solely for `SSL::disable` when the pool member is not on
+  443, and SSL is negotiated once per connection. Nothing in the iRule keeps
+  serverside state between requests, so there is nothing to leak across reuse.
+
+Requests steered to the bot pool and requests falling through to the app pool
+never share a serverside connection: OneConnect keys reuse to the pool member.
+
 ### Case sensitivity
 
 LTM policy string conditions are **case-insensitive by default** — `tmsh help
@@ -172,10 +251,11 @@ python3 xcbot.py deploy --bigip bigip.example.com --as3  out/secureapp_botdefens
 `deploy` uploads and runs the artifact you already reviewed — it never
 regenerates. It prompts before doing anything.
 
-In the tmsh script, **steps 1–7 only create objects**; step 8 is the only one
-that touches the virtual server, and step 8 reads the VS's current iRule list
-and appends to it rather than replacing it. A rollback command list is in the
-footer of every generated script.
+In the tmsh script, **only the second-to-last step touches the virtual server** —
+everything before it just creates objects. That step is numbered for you in the
+banner (`attach to <vs>  <-- affects live traffic`), and it reads the VS's
+current iRule list and appends to it rather than replacing it. The last step
+saves. A rollback command list is in the footer of every generated script.
 
 ### AS3 caveats
 
@@ -183,9 +263,12 @@ footer of every generated script.
   can reference them from.
 - **The declaration does not attach anything to the VS.** A hand-built virtual
   server is not AS3-managed and AS3 will not modify objects it does not own.
-  Attach with the three tmsh commands from step 8, or move the VS into AS3.
+  Attach with the tmsh commands from the attach step, or move the VS into AS3.
 - AS3's forward action has no `fallback-pool`, so that one property from the
   tmsh artifact is not reproduced. It only matters when the bot pool is down.
+- The return-traffic rule is emitted with an empty `actions` array, which is
+  the AS3 equivalent of the action-less tmsh rule. Do not "fix" it by adding
+  a forward: pointing it at the bot pool recreates the loop it prevents.
 - AS3 must be installed on the target (`/mgmt/shared/appsvcs/info`). `deploy`
   checks and tells you if it is not.
 
@@ -200,7 +283,6 @@ footer of every generated script.
 | `render.py` | `build_plan()` and the three renderers |
 | `bigip_api.py` | BIG-IP discovery and deploy |
 | `rest.py` | stdlib HTTP |
-| `bna_vs_test_*.txt` | F5's stock AVK connector iRules, kept for reference — not used by this tool |
 
 `build_plan()` makes every decision; the renderers only describe the plan. That
 is what keeps the GUI steps, the tmsh script and the AS3 declaration from
@@ -214,13 +296,17 @@ drifting apart. Add a decision there, never in a renderer.
 |---|---|
 | `--default-pool` | override the `fallback-pool`; normally read off the VS at run time |
 | `--merge-ops` | one data group + rule per method, at the cost of fidelity (see above) |
+| `--oneconnect-mask` | OneConnect source mask (default `255.255.255.255`; `""` skips the profile) |
 | `--prefix` | prefix for every object name (default `bot-defense`) |
 | `--shape-header` | the loop-guard header name (default `shape-header`) |
 | `--inject-tag` | `head` or `body` |
+| `--inputs` | inputs file to build from (default `botdefense_inputs.json`) |
 | `--out-dir` | default `out/` |
+| `--partition` | BIG-IP partition the VS lives in (default `Common`) |
 | `--raw` | on `fetch`, also save the unmodified XC responses |
 | `--token-file` | read the API token from a file instead of `F5XC_API_TOKEN` |
 | `--policy` | on `fetch`, fail if the infra runs a different policy than expected |
+| `--verify-bigip-tls` | verify the BIG-IP certificate (off by default — it is self-signed) |
 
 `--infra` is what identifies everything else: the infra object names the policy
 that cluster is actually running *and* advertises the host to send traffic to.
@@ -239,8 +325,21 @@ Fetching a policy without one would give you endpoints with nowhere to send them
   `contains`, so a `/` record enables the HTML profile on all HTML responses.
   That is what an XC policy with an `ends-with /` document endpoint is asking
   for; narrow the data group if you want a tighter scope. You get a warning.
+- **Endpoints XC disables are skipped**, reported by name — `metadata.disable`
+  is honoured rather than silently generating a rule for a switched-off endpoint.
+- **A `/` record under `contains` or `starts-with` disables the filter.** It is
+  true of every path, so that method's traffic all reaches the bot pool, static
+  assets included. Easy to produce with `--merge-ops`; detected and warned about.
 - **Paths are validated, not escaped.** Anything carrying a character that could
   break out of a tmsh value, a TCL string, a shell word or an HTML attribute is
   dropped and reported rather than escaped four different ways.
 - **FQDN pool members need DNS** configured on the BIG-IP, and egress to the
   service on 443.
+- **Rule 1 assumes Bot Defense reaches the VS directly**, so the client address
+  the BIG-IP sees really is an egress IP. A SNAT or proxy in between breaks the
+  match and the loop returns. F5's own AVK connector makes the same assumption
+  with its `DG-IPs` group. It is the first thing to check if protected endpoints
+  start hanging.
+- **The version the infra runs may not be the policy's latest.** The config is
+  built from the policy's current content; a mismatch is warned about, naming
+  both versions.

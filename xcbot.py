@@ -275,7 +275,8 @@ def cmd_build(args) -> int:
     plan = build_plan(inputs, vs=vs, default_pool=default_pool,
                       prefix=args.prefix, shape_header=args.shape_header,
                       partition=args.partition, inject_tag=args.inject_tag,
-                      merge_op=args.merge_ops)
+                      merge_op=args.merge_ops,
+                      oneconnect_mask=args.oneconnect_mask)
 
     if bip and not args.yes:
         _collision_check(bip, plan)
@@ -326,6 +327,8 @@ def _collision_check(bip: BigIP, plan: dict) -> None:
         "ltm/rule": [n["irule"]],
         "ltm/policy": [n["policy"]],
         "ltm/profile/html": [n["html_profile"]],
+        "ltm/profile/one-connect": ([n["oneconnect"]]
+                                    if plan["oneconnect"] else []),
         "ltm/html-rule": [n["html_rule"]],
         "ltm/data-group/internal": [dg["name"] for dg in plan["datagroups"]],
     }
@@ -436,6 +439,12 @@ def parse_args(argv: list[str]):
                         "loop guard matches on its absence")
     b.add_argument("--inject-tag", default="head", choices=["head", "body"],
                    help="tag the telemetry <script> is appended to")
+    b.add_argument("--oneconnect-mask", default="255.255.255.255",
+                   metavar="MASK",
+                   help="source mask for the OneConnect profile (default "
+                        "255.255.255.255: confine serverside connection reuse "
+                        "to one client address). Empty string skips the "
+                        "profile entirely")
     b.add_argument("--merge-ops", default="", metavar="OP",
                    choices=["", "contains", "starts-with", "ends-with", "equals"],
                    help="collapse to one data group and one rule per HTTP "
