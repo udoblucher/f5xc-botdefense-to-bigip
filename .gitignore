@@ -1,0 +1,28 @@
+# Fetched XC data. Contains your tenant name, the Bot Defense service host name
+# and its egress IPs -- real infrastructure detail, and regenerable in seconds
+# with `xcbot.py fetch`. Commit it in a PRIVATE repo if you want the audit
+# trail; never in a public one.
+botdefense_inputs.json
+*_inputs.json
+*_raw_infra.json
+*_raw_policy.json
+
+# Generated artifacts -- same reasoning, plus they are outputs, not sources.
+out/
+
+# F5-authored AVK connector iRules, kept locally for reference. Not imported by
+# this tool, not ours to republish, and they carry a policy-specific telemetry
+# header prefix.
+bna_vs_test_*.txt
+
+# Local tooling state: machine addresses and shell history.
+.claude/settings.local.json
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# Editor config -- personal preference, not part of the tool.
+.vscode/
