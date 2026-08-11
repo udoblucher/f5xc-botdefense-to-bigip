@@ -110,7 +110,13 @@ class BigIP:
 
     def existing_names(self, kinds: tuple[str, ...] = (
             "ltm/pool", "ltm/monitor/https", "ltm/data-group/internal",
-            "ltm/rule", "ltm/policy", "ltm/profile/html", "ltm/html-rule")
+            "ltm/rule", "ltm/policy", "ltm/profile/html",
+            # Not 'ltm/html-rule': that is an organizing collection whose items
+            # are {"reference": {"link": ...}} pointers to the per-type
+            # collections, carrying no name and no fullPath. Asking it for
+            # object names yields one blank entry per type and never matches
+            # anything. tag-append-html is the type this tool creates.
+            "ltm/html-rule/tag-append-html")
             ) -> dict[str, list[str]]:
         """Current object paths per kind -- used to warn about collisions.
 
@@ -123,9 +129,21 @@ class BigIP:
                 data = self._get(f"/tm/{kind}")
             except Exception:
                 continue
-            found[kind] = sorted(
-                i.get("fullPath") or f"/{i.get('partition', 'Common')}/{i.get('name', '')}"
-                for i in (data.get("items") or []))
+            names = []
+            for i in (data.get("items") or []):
+                if not isinstance(i, dict):
+                    continue
+                path = i.get("fullPath")
+                if not path:
+                    # An organizing collection, or an item REST declined to
+                    # name. Either way there is nothing to collide with, and
+                    # inventing '/Common/' for it would only produce a name
+                    # that matches nothing and reads like a real object.
+                    if not i.get("name"):
+                        continue
+                    path = f"/{i.get('partition', 'Common')}/{i['name']}"
+                names.append(path)
+            found[kind] = sorted(names)
         return found
 
     # -- deploy --------------------------------------------------------------
