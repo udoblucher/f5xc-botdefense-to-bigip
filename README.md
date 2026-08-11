@@ -18,6 +18,10 @@ python3 xcbot.py build --vs secureapp
 Python 3.7+ standard library only — no `requests`, so it also runs on a stock
 BIG-IP.
 
+**New here?** [QUICKSTART.md](QUICKSTART.md) is the step-by-step: minimum
+requirements, then first fetch to verified traffic. This file is the reference —
+what each object is for, and why it is shaped that way.
+
 ### The API token
 
 `fetch` reads it from `xc_api_token.txt` in the working directory. Run `fetch`
