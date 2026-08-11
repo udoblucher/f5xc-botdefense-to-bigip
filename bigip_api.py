@@ -13,9 +13,14 @@ declaration is POSTed as-is. Nothing is regenerated at deploy time.
 from __future__ import annotations
 
 import json
-import posixpath
 
 from rest import HTTPError, request, request_json
+
+
+def _partition_of(full_path: str) -> str:
+    """Partition an object lives in, read off its /partition/name path."""
+    parts = (full_path or "").strip("/").split("/")
+    return parts[0] if len(parts) > 1 else ""
 
 
 class BigIP:
@@ -35,21 +40,33 @@ class BigIP:
 
     # -- discovery -----------------------------------------------------------
     def virtuals(self) -> list[dict]:
-        """Every virtual server with the fields the build actually needs."""
+        """Every virtual server with the fields the build actually needs.
+
+        The collection spans every partition, so `partition` and `fullPath` come
+        back too: two partitions may hold same-named virtual servers pointing at
+        different applications, and the bare name alone cannot tell them apart.
+        """
         data = self._get("/tm/ltm/virtual?expandSubcollections=true")
         out = []
         for v in (data.get("items") or []):
             out.append({
                 "name": v.get("name", ""),
                 "fullPath": v.get("fullPath", ""),
+                # Trust the field, fall back to reading the path it came from.
+                "partition": v.get("partition") or _partition_of(v.get("fullPath", "")),
                 "destination": (v.get("destination") or "").split("/")[-1],
-                "pool": posixpath.basename(v.get("pool", "")) if v.get("pool") else "",
+                # Kept fully qualified: the application pool can live in a
+                # different partition from the objects being generated, and it
+                # is used verbatim as the rules' fallback-pool.
+                "pool": v.get("pool", "") or "",
                 "profiles": sorted(p.get("name", "") for p in
                                    ((v.get("profilesReference") or {}).get("items") or [])),
                 "policies": sorted(p.get("name", "") for p in
                                    ((v.get("policiesReference") or {}).get("items") or [])
                                    if isinstance(p, dict)),
-                "rules": [posixpath.basename(r) for r in (v.get("rules") or [])],
+                # Also left qualified -- REST reports them that way, and the
+                # same iRule name can exist in more than one partition.
+                "rules": list(v.get("rules") or []),
             })
         return sorted(out, key=lambda x: x["name"])
 
@@ -58,19 +75,28 @@ class BigIP:
 
         Used to spot an existing iRule that selects a pool, which would
         override the generated policy. One list call rather than a GET per
-        name: iRule names can be partition-qualified on the virtual server and
-        the whole list is small.
+        name: the whole list is small.
+
+        Keyed and matched on the qualified path the virtual server reports, so
+        that a same-named iRule in another partition is not mistaken for this
+        one. Names given bare are still matched, on the bare name.
         """
-        wanted = {posixpath.basename(nm) for nm in (names or []) if nm}
+        wanted = {nm for nm in (names or []) if nm}
         if not wanted:
             return {}
         try:
             data = self._get("/tm/ltm/rule")
         except Exception:
             return {}
-        return {i["name"]: i.get("apiAnonymous") or ""
-                for i in (data.get("items") or [])
-                if isinstance(i, dict) and i.get("name") in wanted}
+        out = {}
+        for i in (data.get("items") or []):
+            if not isinstance(i, dict):
+                continue
+            for key in (i.get("fullPath"), i.get("name")):
+                if key and key in wanted:
+                    out[key] = i.get("apiAnonymous") or ""
+                    break
+        return out
 
     def as3_version(self) -> str | None:
         """AS3 version string, or None when the extension is not installed."""
@@ -86,15 +112,20 @@ class BigIP:
             "ltm/pool", "ltm/monitor/https", "ltm/data-group/internal",
             "ltm/rule", "ltm/policy", "ltm/profile/html", "ltm/html-rule")
             ) -> dict[str, list[str]]:
-        """Current object names per kind -- used to warn about collisions."""
+        """Current object paths per kind -- used to warn about collisions.
+
+        Qualified, not bare: an object of the same name in another partition is
+        not a collision, since a partition gets its own full set of objects.
+        """
         found = {}
         for kind in kinds:
             try:
                 data = self._get(f"/tm/{kind}")
             except Exception:
                 continue
-            found[kind] = sorted(i.get("name", "")
-                                 for i in (data.get("items") or []))
+            found[kind] = sorted(
+                i.get("fullPath") or f"/{i.get('partition', 'Common')}/{i.get('name', '')}"
+                for i in (data.get("items") or []))
         return found
 
     # -- deploy --------------------------------------------------------------

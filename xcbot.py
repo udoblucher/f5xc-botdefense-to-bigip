@@ -312,6 +312,28 @@ def _summarize(inputs: dict) -> None:
 # ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
+def _match_vs(virtuals: list, vs: str, partition: str) -> dict | None:
+    """The discovered virtual server the operator meant, or None.
+
+    Bare names are not unique across partitions -- the whole point of the
+    partition flag is that /prod/shop and /dev/shop are different applications
+    -- so the requested partition decides between duplicates. A single
+    unambiguous match anywhere wins even when the partitions disagree: that is
+    the operator naming a real VS, and its own partition is then authoritative.
+    """
+    named = [v for v in virtuals if v["name"] == vs]
+    if len(named) <= 1:
+        return named[0] if named else None
+    part = (partition or "Common").strip("/")
+    hit = next((v for v in named if v.get("partition") == part), None)
+    if not hit:
+        where = ", ".join(sorted(v["fullPath"] or v["name"] for v in named))
+        print(f"  ! {len(named)} virtual servers are named {vs} ({where}), none "
+              f"in {part}. Building for {part} anyway -- name the VS as "
+              f"/partition/{vs} to pick one.", file=sys.stderr)
+    return hit
+
+
 def _pool_selecting_irules(bip: BigIP | None, match: dict | None) -> list:
     """[(iRule name, [commands])] for iRules on the VS that pick a destination.
 
@@ -417,15 +439,29 @@ def cmd_build(args) -> int:
         if bip and not virtuals:
             print("  (none found)", file=sys.stderr)
     if virtuals and not vs:
-        labels = [f"{v['name']}  ->  {v['destination']}  "
+        labels = [f"{v['fullPath'] or v['name']}  ->  {v['destination']}  "
                   f"pool={v['pool'] or '(none)'}" for v in virtuals]
         vs = ask.choose("Which virtual server do you want to protect?",
                         [v["name"] for v in virtuals], vs, labels)
 
     vs = vs or ask.text("Which virtual server do you want to protect?")
 
-    match = next((v for v in virtuals if v["name"] == vs), None)
+    # A VS named as /prod/app carries its own partition: honour it rather than
+    # making the operator repeat it in --partition, which is the commoner slip.
+    if vs.startswith("/") and vs.count("/") >= 2:
+        vs_part, vs = vs.strip("/").split("/", 1)
+        if args.partition not in ("", "Common") and args.partition != vs_part:
+            raise SystemExit(
+                f"--partition {args.partition} conflicts with the virtual "
+                f"server path /{vs_part}/{vs}. Drop one of the two.")
+        args.partition = vs_part
+
+    match = _match_vs(virtuals, vs, args.partition)
     if match:
+        # Same reasoning: the pick-list spans partitions, so the VS the operator
+        # chose is what decides which partition the objects are built in.
+        if match.get("partition"):
+            args.partition = match["partition"]
         if match["policies"] or match["rules"]:
             print(f"  note: {vs} already has policies="
                   f"{match['policies'] or '[]'} rules={match['rules'] or '[]'}",
@@ -438,14 +474,19 @@ def cmd_build(args) -> int:
     conflicts = _pool_selecting_irules(bip, match)
     entrypoints = _entrypoints(args, ask)
 
-    plan = build_plan(inputs, vs=vs, default_pool=default_pool,
-                      prefix=args.prefix, shape_header=args.shape_header,
-                      partition=args.partition, inject_tag=args.inject_tag,
-                      merge_op=args.merge_ops,
-                      oneconnect_mask=args.oneconnect_mask,
-                      entrypoints=entrypoints,
-                      entrypoint_methods=args.entrypoint_methods,
-                      pool_selecting_irules=conflicts)
+    try:
+        plan = build_plan(inputs, vs=vs, default_pool=default_pool,
+                          prefix=args.prefix, shape_header=args.shape_header,
+                          partition=args.partition, inject_tag=args.inject_tag,
+                          merge_op=args.merge_ops,
+                          oneconnect_mask=args.oneconnect_mask,
+                          entrypoints=entrypoints,
+                          entrypoint_methods=args.entrypoint_methods,
+                          pool_selecting_irules=conflicts)
+    except ValueError as e:
+        # Bad option values reach here; a traceback would bury the one line
+        # that says which option to fix.
+        raise SystemExit(str(e))
 
     if bip and not args.yes:
         _collision_check(bip, plan)
@@ -488,8 +529,14 @@ def cmd_build(args) -> int:
 
 
 def _collision_check(bip: BigIP, plan: dict) -> None:
-    """Warn when an object we are about to create already exists."""
+    """Warn when an object we are about to create already exists.
+
+    Scoped to the target partition. The same name in another partition is
+    expected -- that is how two applications get their own Bot Defense config --
+    and warning about it would train the operator to ignore the warning.
+    """
     n = plan["names"]
+    part = (plan["partition"] or "Common").strip("/")
     wanted = {
         "ltm/pool": [n["pool"]],
         "ltm/monitor/https": [n["monitor"]],
@@ -506,8 +553,8 @@ def _collision_check(bip: BigIP, plan: dict) -> None:
     except Exception as e:
         print(f"  (could not check for name collisions: {e})", file=sys.stderr)
         return
-    clashes = [f"{kind} {name}" for kind, names in wanted.items()
-               for name in names if name in existing.get(kind, [])]
+    clashes = [f"{kind} /{part}/{name}" for kind, names in wanted.items()
+               for name in names if f"/{part}/{name}" in existing.get(kind, [])]
     if clashes:
         print("\n  These objects already exist on the BIG-IP and the generated "
               "create commands would fail:", file=sys.stderr)
@@ -595,7 +642,9 @@ def parse_args(argv: list[str]):
 
     b = sub.add_parser("build", help="render the configuration artifacts")
     b.add_argument("--inputs", default=DEFAULT_INPUTS)
-    b.add_argument("--vs", default="", help="virtual server to protect")
+    b.add_argument("--vs", default="",
+                   help="virtual server to protect. /partition/name sets "
+                        "--partition too")
     b.add_argument("--default-pool", default="",
                    help="override the rules' fallback-pool. Rarely needed: left "
                         "unset, the tmsh script reads the pool off the virtual "
@@ -628,7 +677,13 @@ def parse_args(argv: list[str]):
                         "method by rewriting every path matcher to OP. Fewer "
                         "objects, but no longer what XC specified -- 'contains' "
                         "is the only OP that cannot miss a protected endpoint")
-    b.add_argument("--partition", default="Common")
+    b.add_argument("--partition", default="Common", metavar="NAME",
+                   help="BIG-IP partition to build in (default: Common). A "
+                        "full set of objects is created inside it rather than "
+                        "shared out of /Common, so partitions serving "
+                        "different XC namespaces can point at different Bot "
+                        "Defense policies and infrastructure. Implied by a "
+                        "virtual server named as /partition/name")
     b.add_argument("--out-dir", default="out")
     b.add_argument("--ui", action="store_true", help="write the GUI walkthrough")
     b.add_argument("--tmsh", action="store_true", help="write the tmsh script")

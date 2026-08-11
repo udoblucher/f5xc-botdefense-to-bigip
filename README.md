@@ -275,6 +275,45 @@ longer says what XC says:
 Left alone, the default reproduces XC faithfully. Reach for `--merge-ops` when
 you would rather curate one list per method by hand than track what XC says.
 
+### Partitions
+
+`--partition NAME` builds the whole set inside that partition. Nothing else
+changes — the object names, the policy, the iRule and the walkthrough are the
+same; only where they land differs.
+
+```bash
+python3 xcbot.py build --vs shop --partition prod
+python3 xcbot.py build --vs /prod/shop          # same thing: the path sets it
+```
+
+**A partition gets its own copy of every object, rather than sharing one set out
+of `/Common`.** That is deliberate. Two partitions usually serve two different
+applications, and those can sit behind different XC namespaces, so their Bot
+Defense policy, protected endpoints, egress IPs and infra host are all different.
+Sharing would force them to agree. Duplicate `bot-defense-pool` objects in
+`/prod` and `/dev` pointing at different infra is the normal case, not a mistake.
+Each build only ever reads and writes its own partition: the collision check
+ignores same-named objects elsewhere, and the same name in another partition is
+never reported as a conflict.
+
+Two things differ per artifact, because the three targets name objects
+differently:
+
+- **The tmsh script** names everything absolutely (`/prod/bot-defense-pool`). It
+  has to: a bare name resolves in the *current* folder, which for a root shell is
+  `/Common`, so `modify ltm virtual shop` on a VS in `/prod` fails with
+  `01020036:3: The requested Virtual Server (/Common/shop) was not found`. The
+  script also gains a **preflight step** that exits before creating anything if
+  the partition does not exist or the VS is not in it — otherwise a typo leaves
+  a half-applied config, with the objects built and the attach step failing.
+- **The GUI walkthrough** keeps bare names and opens with a note to set the
+  **Partition / Path** selector first. The GUI has no per-object partition field:
+  objects land in whatever that selector is showing.
+
+`--partition` and a `/partition/name` VS are checked against each other; naming
+both differently is an error rather than a guess. With `--bigip`, the partition
+of the virtual server you pick wins, since the pick-list spans every partition.
+
 ### Coexisting with existing iRules
 
 > **If the target virtual server already has an iRule that conditionally selects
@@ -409,12 +448,25 @@ In the tmsh script, **only the second-to-last step touches the virtual server** 
 everything before it just creates objects. That step is numbered for you in the
 banner (`attach to <vs>  <-- affects live traffic`), and it reads the VS's
 current iRule list and appends to it rather than replacing it. The last step
-saves. A rollback command list is in the footer of every generated script.
+saves. A rollback command list is in the footer of every generated script, in
+dependency order — the iRule has to come off the virtual server *before* the
+HTML profile it calls `HTML::disable` on, or the detach is refused.
 
 ### AS3 caveats
 
-- Objects go into `/Common/Shared/`, which is where a `/Common` virtual server
-  can reference them from.
+- Objects go into `/<partition>/Shared/`, which is where a virtual server in that
+  partition can reference them from. The AS3 tenant *is* the BIG-IP partition.
+- **With `--partition`, AS3 takes ownership of the whole partition.** Posting the
+  declaration makes AS3 authoritative for that tenant, and it removes objects in
+  it that are not in the declaration — so a partition someone built by hand loses
+  that config. `/Common` is exempt, which is why the default target is safe and a
+  named partition is not. The declaration carries this warning in its own
+  `remark`. Deploy the tmsh artifact instead unless the partition is already
+  AS3-managed.
+- **The embedded iRule names the entrypoint data group differently from the
+  `.tcl` file**, and that is correct rather than drift: AS3 puts the data group in
+  `/<partition>/Shared/` while tmsh puts it beside the virtual server, and
+  `class match` does not search for it (see Known behaviour).
 - **The declaration does not attach anything to the VS.** A hand-built virtual
   server is not AS3-managed and AS3 will not modify objects it does not own.
   Attach with the tmsh commands from the attach step, or move the VS into AS3.
@@ -459,7 +511,7 @@ drifting apart. Add a decision there, never in a renderer.
 | `--inject-tag` | `head` or `body` |
 | `--inputs` | inputs file to build from (default `botdefense_inputs.json`) |
 | `--out-dir` | default `out/` |
-| `--partition` | BIG-IP partition the VS lives in (default `Common`) |
+| `--partition` | partition to build the whole set in (default `Common`); implied by a `/partition/name` VS. See [Partitions](#partitions) |
 | `--raw` | on `fetch`, also save the unmodified XC responses |
 | `--token-file` | read the API token from a different file than `./xc_api_token.txt` |
 | `--policy` | on `fetch`, fail if the infra runs a different policy than expected |
@@ -485,6 +537,15 @@ Fetching a policy without one would give you endpoints with nowhere to send them
   `class match -value -- /static/app.css contains <dg>` returns the record's
   value. You get a warning until you pass `--entrypoint`. See
   [Entrypoints are not mapped for you](#entrypoints-are-not-fetched--they-are-yours-to-map).
+- **`class match` resolves a data group against the *virtual server's* folder,
+  not the iRule's, and it does not search.** Measured on 17.5.1 with the rule and
+  data group both in `/part/Shared` and the VS in `/part`: only the full
+  `/part/Shared/<name>` resolves — a bare name and `/part/<name>` both raise a TCL
+  error, which aborts the event and takes the request with it. This is why the
+  iRule inside the AS3 declaration names the data group with its full
+  `/<partition>/Shared/` path while the `.tcl` file and the tmsh script name it
+  where they put it. The two are generated from the same source with one
+  parameter; do not paste one into the other's deployment.
 - **Endpoints XC disables are skipped**, reported by name — `metadata.disable`
   is honoured rather than silently generating a rule for a switched-off endpoint.
 - **A `/` record under `contains` or `starts-with` disables the filter.** It is
