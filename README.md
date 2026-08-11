@@ -196,6 +196,63 @@ longer says what XC says:
 Left alone, the default reproduces XC faithfully. Reach for `--merge-ops` when
 you would rather curate one list per method by hand than track what XC says.
 
+### Coexisting with existing iRules
+
+**An iRule's `pool` command beats the LTM policy's forward action, and iRule
+priority does not change that.** Verified on 17.5.1 with three pools — one on the
+virtual server, one selected by a policy rule, one selected by an iRule — logging
+the winner from `LB_SELECTED`:
+
+| Request | Final pool |
+|---|---|
+| neither condition | the VS's pool |
+| policy condition only | the policy's pool |
+| iRule condition only | the iRule's pool |
+| **both** | **the iRule's pool** |
+
+```
+iRule HTTP_REQUEST priority 100 + policy forward  ->  the iRule's pool
+iRule HTTP_REQUEST priority 500 + policy forward  ->  the iRule's pool
+iRule HTTP_REQUEST priority 999 + policy forward  ->  the iRule's pool
+```
+
+Even at priority 100 — running before the policy — the iRule wins. You cannot
+reorder your way out of it.
+
+So if the target virtual server already has an iRule that conditionally selects
+a pool, then **for exactly those requests this entire steering policy is
+bypassed**:
+
+- Protected endpoints reach the application uninspected. No error, no log — the
+  pool stays green and coverage is simply gone.
+- Rule 0 breaks too, and worse: the telemetry JS gets served by the application
+  pool, which has no such path, so the script 404s and never loads. Entrypoint
+  protection goes with it, not just the endpoints the iRule touched.
+- Rule 1 is unaffected in practice — return traffic wants the application, which
+  is where the iRule was sending it anyway.
+
+Three ways out, best first:
+
+1. **Guard the existing iRule** so it defers on Bot Defense's paths:
+
+   ```tcl
+   when HTTP_REQUEST {
+       set p [string tolower [HTTP::path -normalized]]
+       if { [class match $p contains bot-defense-js] } { return }
+       # ... existing conditional pool logic ...
+   }
+   ```
+
+2. **Move steering into an iRule** instead of the policy. This is exactly why
+   F5's own AVK connector selects its pool in an iRule at `HTTP_REQUEST priority
+   999` rather than using an LTM policy — it never competes in the first place.
+3. **Drop the conflicting logic** if the policy can express it.
+
+The generated iRule sets **no** pool — only `HTML::enable`/`disable` and
+`SSL::disable` — so it never fights an existing pool-selecting iRule in either
+direction. Nothing here has to be reconciled *with* it; the conflict, if any, is
+between your existing iRule and the LTM policy.
+
 ### OneConnect
 
 A OneConnect profile is created with `source-mask 255.255.255.255` and attached
@@ -343,3 +400,7 @@ Fetching a policy without one would give you endpoints with nowhere to send them
 - **The version the infra runs may not be the policy's latest.** The config is
   built from the policy's current content; a mismatch is warned about, naming
   both versions.
+- **An existing iRule that sets a pool silently defeats the whole policy** for
+  the requests it touches. See
+  [Coexisting with existing iRules](#coexisting-with-existing-irules) — this is
+  the one to check before rolling onto a virtual server someone else built.
