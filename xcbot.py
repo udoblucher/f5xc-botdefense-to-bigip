@@ -433,8 +433,14 @@ def cmd_build(args) -> int:
         except Exception as e:
             # Discovery is a convenience, not a dependency -- fall back to
             # asking rather than failing a build that needs no BIG-IP at all.
-            print(f"  could not read virtual servers ({e}); falling back to "
-                  f"prompting", file=sys.stderr)
+            print(f"  could not read virtual servers ({e})", file=sys.stderr)
+            print("  continuing without discovery: no pick-list, no fallback "
+                  "pool read off the VS, no collision or existing-iRule "
+                  "warnings.", file=sys.stderr)
+            if isinstance(e, HTTPError) and e.status == 401:
+                print(f"  401 is the username or the password. --bigip-user is "
+                      f"'{args.bigip_user}'; the password comes from BIGIP_PASS "
+                      f"or the prompt.", file=sys.stderr)
             bip = None
         if bip and not virtuals:
             print("  (none found)", file=sys.stderr)

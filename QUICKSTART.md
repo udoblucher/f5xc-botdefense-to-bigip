@@ -16,7 +16,7 @@ iRules](README.md#coexisting-with-existing-irules).
 | Python | 3.7 or newer. Standard library only — nothing to `pip install`. |
 | OS | Anything Python runs on. macOS, Linux, or the BIG-IP itself. |
 | Network | Outbound HTTPS to `<tenant>.console.ves.volterra.io`, for `fetch` only. `build` needs no network at all. |
-| Optional | Reachability of the BIG-IP management address, if you want `--bigip` discovery or `deploy`. |
+| Optional | Reachability of the BIG-IP management address, if you want `--bigip` discovery or `deploy`. iControl REST is on the management address, port 443 by default — if yours runs elsewhere (`tmsh list sys httpd ssl-port`), pass it as `--bigip host:8443`. |
 
 **In F5 Distributed Cloud**
 

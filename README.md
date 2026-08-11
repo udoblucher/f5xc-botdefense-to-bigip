@@ -80,6 +80,11 @@ python3 xcbot.py fetch --tenant acme
 python3 xcbot.py build --bigip bigip.example.com --bigip-user admin
 ```
 
+`--bigip` talks to iControl REST on the management address, port 443 by
+default. Where httpd is on another port — `tmsh list sys httpd ssl-port` — give
+it as `--bigip host:8443`. Discovery is a convenience, never a dependency: if
+the BIG-IP cannot be read, the build says what it is giving up and carries on.
+
 `--yes` turns every unanswered question into an error instead of a prompt, for
 CI. So does a non-tty stdin.
 

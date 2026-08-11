@@ -9,19 +9,37 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import ssl
 import urllib.error
 import urllib.request
 from typing import Any
 
 
+def _one_line(body: str, limit: int = 200) -> str:
+    """The part of an error body worth printing, on one line.
+
+    BIG-IP answers an unauthenticated request with a full Apache HTML page, so
+    quoting the body verbatim buries "401 Unauthorized" in fourteen lines of
+    markup. The title carries the whole message in that case; where there is no
+    title, tags are dropped and the text kept.
+    """
+    text = body.strip()
+    if text[:400].lower().lstrip().startswith(("<!doctype", "<html")) \
+            or "<html" in text[:400].lower():
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        text = m.group(1) if m else re.sub(r"<[^>]+>", " ", text)
+    text = " ".join(text.split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 class HTTPError(RuntimeError):
-    """Non-2xx HTTP response. Carries the status and the (truncated) body."""
+    """Non-2xx HTTP response. Carries the status and the (untruncated) body."""
 
     def __init__(self, status: int, url: str, body: str):
         self.status = status
         self.body = body
-        super().__init__(f"HTTP {status} for {url}: {body[:400]}")
+        super().__init__(f"HTTP {status} for {url}: {_one_line(body)}")
 
 
 def _ctx(verify: bool) -> ssl.SSLContext:
