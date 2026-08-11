@@ -25,7 +25,8 @@ be committed, diffed and reviewed as the record of what XC said.
 
 Python 3.7+ standard library only.
 
-  export F5XC_API_TOKEN=...
+  python3 xcbot.py fetch --tenant acme       # writes xc_api_token.txt, then
+                                             # tells you to paste your token in
   python3 xcbot.py fetch --tenant acme --namespace bot-defense \\
                          --infra my-bot-infra
   python3 xcbot.py build --vs secureapp
@@ -43,9 +44,28 @@ import urllib.error
 import xc_api
 from bigip_api import BigIP
 from rest import HTTPError
-from render import build_plan, render_as3, render_tmsh, render_ui
+from render import (build_plan, irule_selects_pool, render_as3, render_tmsh,
+                    render_ui)
 
 DEFAULT_INPUTS = "botdefense_inputs.json"
+
+# The XC API token lives in a file by default. An environment variable is
+# invisible once set -- there is nothing to look at to see whether it is right,
+# it vanishes with the shell, and it lands in shell history. A file you can open,
+# read, and correct. It is gitignored, and created with 0600 on first run.
+DEFAULT_TOKEN_FILE = "xc_api_token.txt"
+TOKEN_PLACEHOLDER = "PASTE_YOUR_XC_API_TOKEN_HERE"
+TOKEN_TEMPLATE = f"""\
+# F5 Distributed Cloud API token, read by xcbot.py fetch.
+#
+# Replace the last line of this file with your token. Get one in the XC console:
+#   Administration >> Personal Management >> Credentials >> Add Credentials
+#   Credential type: API Token
+#
+# Lines starting with # are ignored, so these notes can stay. Do not commit this
+# file -- .gitignore already excludes it.
+{TOKEN_PLACEHOLDER}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -114,11 +134,74 @@ class Asker:
         return default if not raw else raw in ("y", "yes")
 
 
+def _read_token_file(path: str) -> str:
+    """First non-comment, non-empty line of a token file, or "" if unreadable.
+
+    Comments are allowed so the file can explain itself -- it is the one file a
+    person edits by hand, and a bare token in a bare file gives no hint what it
+    is or where it came from.
+    """
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except OSError:
+        return ""
+    return ""
+
+
+def _write_token_template(path: str) -> bool:
+    """Create the token file with a placeholder. False if it already exists."""
+    if os.path.exists(os.path.expanduser(path)):
+        return False
+    try:
+        with open(os.path.expanduser(path), "w") as fh:
+            fh.write(TOKEN_TEMPLATE)
+        # The file is about to hold a credential, so narrow it before it does.
+        os.chmod(os.path.expanduser(path), 0o600)
+    except OSError:
+        return False
+    return True
+
+
 def _token(args) -> str:
+    """The XC API token: --token-file, then the default file, then the env var.
+
+    File before environment because the file is the one a person can find, see
+    the state of, and edit again next month. The env var still wins nothing but
+    still works, which is what CI wants.
+    """
     if args.token_file:
-        with open(os.path.expanduser(args.token_file)) as fh:
-            return fh.read().strip()
-    return os.environ.get("F5XC_API_TOKEN", "").strip()
+        if not os.path.exists(os.path.expanduser(args.token_file)):
+            raise SystemExit(f"No such file: {args.token_file}")
+        token = _read_token_file(args.token_file)
+        if not token or token == TOKEN_PLACEHOLDER:
+            raise SystemExit(
+                f"No token in {args.token_file}. Open it and put your XC API "
+                f"token on a line of its own ('#' starts a comment).")
+        return token
+
+    token = _read_token_file(DEFAULT_TOKEN_FILE)
+    if token and token != TOKEN_PLACEHOLDER:
+        return token
+
+    env = os.environ.get("F5XC_API_TOKEN", "").strip()
+    if env:
+        return env
+
+    created = _write_token_template(DEFAULT_TOKEN_FILE)
+    raise SystemExit(
+        f"No XC API token yet.\n\n"
+        f"  1. Open {DEFAULT_TOKEN_FILE}"
+        + (" (just created for you)" if created else "") + "\n"
+        f"  2. Replace the {TOKEN_PLACEHOLDER} line with your token\n"
+        f"  3. Run the same command again\n\n"
+        f"Get a token in the XC console under Administration >> Personal "
+        f"Management >> Credentials >> Add Credentials, type 'API Token'.\n"
+        f"Another file works too: --token-file PATH. So does the "
+        f"F5XC_API_TOKEN environment variable.")
 
 
 def _bigip(args, ask: Asker, required: bool = False) -> BigIP | None:
@@ -209,7 +292,9 @@ def _summarize(inputs: dict) -> None:
     print(f"  Endpoints          : {len(inputs['endpoints'])}", file=out)
     for ep in inputs["endpoints"]:
         marks = ",".join(ep["methods"]) or "ANY"
-        tag = "  <- entrypoint (JS injected here)" if ep["entrypoint"] else ""
+        # GET_DOCUMENT is shown because it is what XC says, not because it is
+        # the injection list -- 'build' asks for that separately.
+        tag = "  <- XC GET_DOCUMENT" if ep.get("get_document") else ""
         desc = f" {ep['combine']} ".join(
             f"{m['op']} {m['value']}" + (" (nocase)" if m["nocase"] else "")
             + (" NOT" if m["negate"] else "") for m in ep["matches"])
@@ -219,12 +304,89 @@ def _summarize(inputs: dict) -> None:
     if inputs.get("mobile_endpoint_count"):
         print(f"  Mobile endpoints   : {inputs['mobile_endpoint_count']} "
               f"(skipped -- SDK, not JS)", file=out)
+    print(f"  JS injection       : not in this file -- XC does not record which "
+          f"pages\n                       need the <script>. 'build' asks.", file=out)
     print("", file=out)
 
 
 # ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
+def _pool_selecting_irules(bip: BigIP | None, match: dict | None) -> list:
+    """[(iRule name, [commands])] for iRules on the VS that pick a destination.
+
+    Those override the generated policy at every iRule priority, so their
+    presence is a reason not to use the policy at all. Only checkable with a
+    BIG-IP to read; an offline build says so in the artifacts instead.
+    """
+    if not (bip and match and match.get("rules")):
+        return []
+    try:
+        bodies = bip.irule_bodies(match["rules"])
+    except Exception as e:
+        print(f"  (could not read iRule bodies: {e})", file=sys.stderr)
+        return []
+    found = []
+    for name in match["rules"]:
+        cmds = irule_selects_pool(bodies.get(name, ""))
+        if cmds:
+            found.append((name, cmds))
+            print(f"  ! iRule {name} selects a destination itself "
+                  f"({', '.join(cmds)})", file=sys.stderr)
+    return found
+
+
+def _entrypoints(args, ask: Asker) -> list[str]:
+    """Paths whose HTML response gets the telemetry <script>.
+
+    Asked, not fetched. XC records which endpoints are protected; it does not
+    record which pages carry the script that protects them -- those are the
+    pages holding a form (or JS) that fires a protected endpoint, which is a
+    property of the application's HTML. Nothing in the API describes it, so the
+    honest options are "the operator knows" or "all of it".
+    """
+    given = []
+    for p in (args.entrypoint or []):
+        cleaned = xc_api.clean_path(p, anchor=True)
+        if not cleaned:
+            raise SystemExit(f"--entrypoint {p!r} is not a usable path.")
+        given.append(cleaned)
+    if given:
+        return given
+
+    if not ask.interactive:
+        # Nobody to ask, so the fallback applies. build_plan warns about it;
+        # explaining the choice to a log nobody is reading is just noise.
+        return []
+    print("\nJS injection scope\n"
+          "  The telemetry <script> belongs on the pages carrying a form (or\n"
+          "  JS) that fires a protected endpoint. XC does not record which\n"
+          "  pages those are, so it cannot be fetched -- either you have\n"
+          "  mapped them, or the script goes into every HTML response.",
+          file=sys.stderr)
+    if ask.choose("Have the entrypoint pages been mapped?",
+                  ["all", "mapped"], "all",
+                  ["No  -- inject across the whole application "
+                   "(data group gets '/')",
+                   "Yes -- type the entrypoint paths now"]) != "mapped":
+        return []
+
+    while True:
+        raw = ask.text("Entrypoint paths, comma-separated "
+                       "(e.g. /login,/account/transfer)")
+        paths, bad = [], []
+        for chunk in raw.split(","):
+            if not chunk.strip():
+                continue
+            cleaned = xc_api.clean_path(chunk.strip(), anchor=True)
+            (paths if cleaned else bad).append(cleaned or chunk.strip())
+        if bad:
+            print(f"  not usable as a path: {', '.join(bad)}", file=sys.stderr)
+            continue
+        if paths:
+            return paths
+
+
 def cmd_build(args) -> int:
     ask = Asker(not args.yes)
 
@@ -241,7 +403,8 @@ def cmd_build(args) -> int:
     # Which VS? Ask the BIG-IP when we can, so the names are real ones.
     vs, default_pool = args.vs, args.default_pool
     bip = _bigip(args, ask) if args.bigip else None
-    if bip and not (vs and default_pool):
+    virtuals = []
+    if bip:
         print(f"Reading virtual servers from {args.bigip} ...", file=sys.stderr)
         try:
             virtuals = bip.virtuals()
@@ -250,33 +413,39 @@ def cmd_build(args) -> int:
             # asking rather than failing a build that needs no BIG-IP at all.
             print(f"  could not read virtual servers ({e}); falling back to "
                   f"prompting", file=sys.stderr)
-            virtuals = []
             bip = None
-        if not virtuals:
+        if bip and not virtuals:
             print("  (none found)", file=sys.stderr)
-        else:
-            labels = [f"{v['name']}  ->  {v['destination']}  "
-                      f"pool={v['pool'] or '(none)'}" for v in virtuals]
-            vs = vs or ask.choose("Which virtual server do you want to protect?",
-                                  [v["name"] for v in virtuals], vs, labels)
-            match = next((v for v in virtuals if v["name"] == vs), None)
-            if match:
-                if match["policies"] or [r for r in match["rules"]]:
-                    print(f"  note: {vs} already has policies="
-                          f"{match['policies'] or '[]'} rules={match['rules'] or '[]'}",
-                          file=sys.stderr)
-                default_pool = default_pool or match["pool"]
+    if virtuals and not vs:
+        labels = [f"{v['name']}  ->  {v['destination']}  "
+                  f"pool={v['pool'] or '(none)'}" for v in virtuals]
+        vs = ask.choose("Which virtual server do you want to protect?",
+                        [v["name"] for v in virtuals], vs, labels)
 
     vs = vs or ask.text("Which virtual server do you want to protect?")
-    # Deliberately not prompted for. It only sets the rules' fallback-pool, and
-    # leaving it empty makes the tmsh script read that off the VS when it runs,
-    # which is both correct and free. --default-pool overrides.
+
+    match = next((v for v in virtuals if v["name"] == vs), None)
+    if match:
+        if match["policies"] or match["rules"]:
+            print(f"  note: {vs} already has policies="
+                  f"{match['policies'] or '[]'} rules={match['rules'] or '[]'}",
+                  file=sys.stderr)
+        # Deliberately not prompted for. It only sets the rules' fallback-pool,
+        # and leaving it empty makes the tmsh script read that off the VS when
+        # it runs, which is both correct and free. --default-pool overrides.
+        default_pool = default_pool or match["pool"]
+
+    conflicts = _pool_selecting_irules(bip, match)
+    entrypoints = _entrypoints(args, ask)
 
     plan = build_plan(inputs, vs=vs, default_pool=default_pool,
                       prefix=args.prefix, shape_header=args.shape_header,
                       partition=args.partition, inject_tag=args.inject_tag,
                       merge_op=args.merge_ops,
-                      oneconnect_mask=args.oneconnect_mask)
+                      oneconnect_mask=args.oneconnect_mask,
+                      entrypoints=entrypoints,
+                      entrypoint_methods=args.entrypoint_methods,
+                      pool_selecting_irules=conflicts)
 
     if bip and not args.yes:
         _collision_check(bip, plan)
@@ -415,9 +584,9 @@ def parse_args(argv: list[str]):
     f.add_argument("--out", default=DEFAULT_INPUTS)
     f.add_argument("--raw", action="store_true",
                    help="also save the unmodified XC responses")
-    f.add_argument("--token-file", default="",
-                   help="read the API token from this file instead of "
-                        "F5XC_API_TOKEN")
+    f.add_argument("--token-file", default="", metavar="PATH",
+                   help=f"read the API token from PATH instead of "
+                        f"./{DEFAULT_TOKEN_FILE}")
     f.add_argument("--no-verify-tls", action="store_true",
                    help="skip TLS verification against XC (lab only)")
     f.add_argument("--yes", "-y", action="store_true",
@@ -439,6 +608,14 @@ def parse_args(argv: list[str]):
                         "loop guard matches on its absence")
     b.add_argument("--inject-tag", default="head", choices=["head", "body"],
                    help="tag the telemetry <script> is appended to")
+    b.add_argument("--entrypoint", action="append", metavar="PATH",
+                   help="page whose HTML response gets the telemetry <script>; "
+                        "repeat once per page. XC does not record these, so "
+                        "they are asked for. Omit and the data group gets '/', "
+                        "which injects into every HTML response")
+    b.add_argument("--entrypoint-methods", default="GET", metavar="VERBS",
+                   help="methods recorded against each entrypoint (default "
+                        "GET: injection happens on the document request)")
     b.add_argument("--oneconnect-mask", default="255.255.255.255",
                    metavar="MASK",
                    help="source mask for the OneConnect profile (default "

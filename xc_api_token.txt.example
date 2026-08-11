@@ -1,0 +1,12 @@
+# F5 Distributed Cloud API token, read by xcbot.py fetch.
+#
+# Copy this file to xc_api_token.txt and replace the last line with your token.
+# (xcbot.py fetch creates xc_api_token.txt for you if it is missing.)
+#
+# Get a token in the XC console:
+#   Administration >> Personal Management >> Credentials >> Add Credentials
+#   Credential type: API Token
+#
+# Lines starting with # are ignored, so these notes can stay. xc_api_token.txt
+# is gitignored; this .example file is the one that gets committed.
+PASTE_YOUR_XC_API_TOKEN_HERE

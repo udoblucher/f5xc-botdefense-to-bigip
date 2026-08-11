@@ -1,3 +1,9 @@
+# The XC API token. xcbot.py creates xc_api_token.txt with a placeholder on
+# first run; xc_api_token.txt.example is the committed copy of that placeholder.
+xc_api_token.txt
+*_token.txt
+!*_token.txt.example
+
 # Fetched XC data. Contains your tenant name, the Bot Defense service host name
 # and its egress IPs -- real infrastructure detail, and regenerable in seconds
 # with `xcbot.py fetch`. Commit it in a PRIVATE repo if you want the audit

@@ -53,6 +53,25 @@ class BigIP:
             })
         return sorted(out, key=lambda x: x["name"])
 
+    def irule_bodies(self, names) -> dict[str, str]:
+        """Body text of the named iRules, keyed by name.
+
+        Used to spot an existing iRule that selects a pool, which would
+        override the generated policy. One list call rather than a GET per
+        name: iRule names can be partition-qualified on the virtual server and
+        the whole list is small.
+        """
+        wanted = {posixpath.basename(nm) for nm in (names or []) if nm}
+        if not wanted:
+            return {}
+        try:
+            data = self._get("/tm/ltm/rule")
+        except Exception:
+            return {}
+        return {i["name"]: i.get("apiAnonymous") or ""
+                for i in (data.get("items") or [])
+                if isinstance(i, dict) and i.get("name") in wanted}
+
     def as3_version(self) -> str | None:
         """AS3 version string, or None when the extension is not installed."""
         try:

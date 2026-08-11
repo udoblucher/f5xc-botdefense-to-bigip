@@ -40,18 +40,23 @@ into; the BIG-IP does not evaluate bot policy itself. Two independent jobs:
 
   Injection (HTML profile + iRule)
       The telemetry <script> is injected into the <head> of responses, but only
-      on entrypoints -- the pages XC marks GET_DOCUMENT. The iRule disables the
-      HTML profile by default and re-enables it per response, so the parser
-      never runs on traffic that does not need it.
+      on entrypoints. The iRule disables the HTML profile by default and
+      re-enables it per response, so the parser never runs on traffic that does
+      not need it.
 
-Object names, paths and methods all come from XC. Only the virtual server, its
-default pool and the name prefix come from the operator.
+      Which pages are entrypoints does NOT come from XC -- see
+      _entrypoint_records. The operator supplies the list, or the data group
+      gets "/" and the script goes into every HTML response.
+
+Object names, endpoint paths and methods come from XC. The virtual server, the
+entrypoint list, the default pool and the name prefix come from the operator.
 """
 
 from __future__ import annotations
 
 import datetime
 import json
+import re
 
 # Operator names are shared verbatim by tmsh and AS3 -- only negation differs,
 # because AS3 folds it into the operator instead of using a `not` keyword.
@@ -176,20 +181,63 @@ def _endpoint_buckets(inputs: dict, dg_prefix: str,
     return out, warnings
 
 
-def _entrypoint_records(inputs: dict) -> list[tuple[str, str]]:
+# Whole-application fallback for the injection data-group. Every path contains
+# "/", and the iRule matches entrypoints with `contains`, so this one record
+# enables the HTML profile on every HTML response the VS returns.
+ENTRYPOINT_ALL = "/"
+
+
+def _entrypoint_records(paths, methods: str = "GET") -> list[tuple[str, str]]:
     """(path, methods) records for the JS-injection data-group.
+
+    NOT derived from XC, deliberately. The policy records which endpoints are
+    protected; it does not record which pages have to carry the telemetry
+    script. Those are the pages holding the form (or the JS) that fires a
+    protected endpoint -- a property of the application's HTML that nothing in
+    the API describes. GET_DOCUMENT looks like the answer and is not: it marks
+    endpoints XC expects to serve a document, not injection sites.
+
+    So the list comes from the operator. With none given, the data group gets
+    "/" and the script goes everywhere: too wide, but it cannot miss a page,
+    which is the right way round for a fallback. Either way this data group is
+    maintained by hand from then on.
 
     Keys are lowercased because the iRule lowercases the request path before
     matching. The value holds the methods, which the iRule tests with a
     substring check -- that is why they are comma-joined rather than a list.
     """
-    recs: dict[str, set] = {}
-    for ep in inputs.get("endpoints", []):
-        if not ep.get("entrypoint"):
-            continue
-        for m in ep.get("matches", []):
-            recs.setdefault(m["value"].lower(), set()).update(ep.get("methods") or ["GET"])
-    return [(k, ",".join(sorted(v))) for k, v in sorted(recs.items())]
+    verbs = ",".join(sorted({m.strip().upper()
+                             for m in (methods or "").split(",")
+                             if m.strip()})) or "GET"
+    out: list[tuple[str, str]] = []
+    seen = set()
+    for p in (list(paths) or [ENTRYPOINT_ALL]):
+        key = (p or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append((key, verbs))
+    return out or [(ENTRYPOINT_ALL, verbs)]
+
+
+# TCL commands that pick a destination themselves. Any of these in an iRule on
+# the target VS overrides this policy's forward action -- verified on 17.5.1 at
+# HTTP_REQUEST priorities 100, 500 and 999, the iRule winning at all three.
+_POOL_CMDS = ("pool", "node", "virtual", "LB::reselect", "LB::detach")
+
+
+def irule_selects_pool(body: str) -> list[str]:
+    """Destination-selecting commands used by an iRule body.
+
+    A deliberately blunt scan: comment lines are dropped and the rest is tested
+    for each command at statement position. It feeds a warning, not a decision,
+    so a false positive costs a sentence of reading and a false negative costs
+    silently uninspected traffic.
+    """
+    text = "\n".join(line.strip() for line in (body or "").splitlines()
+                     if not line.strip().startswith("#"))
+    return [cmd for cmd in _POOL_CMDS
+            if re.search(r"(?:^|[{;\]]\s*)" + re.escape(cmd) + r"\s",
+                         text, re.M)]
 
 
 def build_irule(plan: dict) -> str:
@@ -202,13 +250,15 @@ def build_irule(plan: dict) -> str:
 # This rule does NOT steer traffic -- the LTM policy {n['policy']} does that.
 # Its job is to keep the HTML parser off every response that does not need it:
 # the HTML profile is disabled by default and enabled only for responses to a
-# request whose path is an XC entrypoint (a GET_DOCUMENT endpoint).
+# request whose path is listed in the {n['dg_entry']} data group.
 when RULE_INIT {{
     # 1 = log every request decision to /var/log/ltm, 0 = silent.
     # Leave at 1 while validating, then set to 0 and reload the rule.
     set static::botdefense_debug 1
-    # Entrypoint paths + their methods. Change the data-group to change the
-    # injection scope -- no need to touch this rule.
+    # Entrypoint paths + their methods, matched with `contains`. XC does not
+    # say which pages need the script, so this data group is maintained by
+    # hand: add a record per page, and drop the "/" catch-all once you have.
+    # Changing the injection scope means editing the data group, not this rule.
     set static::botdefense_entrypoints "{n['dg_entry']}"
 }}
 
@@ -251,7 +301,9 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
                prefix: str = "bot-defense", shape_header: str = "shape-header",
                partition: str = "Common", inject_tag: str = "head",
                merge_op: str = "",
-               oneconnect_mask: str = "255.255.255.255") -> dict:
+               oneconnect_mask: str = "255.255.255.255",
+               entrypoints=(), entrypoint_methods: str = "GET",
+               pool_selecting_irules=()) -> dict:
     """Every decision that turns XC data + operator answers into objects.
 
     `default_pool` is optional and feeds exactly one property: the per-rule
@@ -263,6 +315,14 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
     Left empty, the tmsh script reads the pool off the virtual server when it
     runs, so the fallback is right without anyone naming it. Pass it only to
     override that, or when generating for a VS that does not exist yet.
+
+    `entrypoints` are the paths whose HTML response gets the <script>. Empty
+    means "not mapped": the data group gets "/" and the script goes into every
+    HTML response. See _entrypoint_records for why this cannot come from XC.
+
+    `pool_selecting_irules` is [(name, [commands])] for iRules already on the
+    VS that choose a destination themselves. Those beat this policy, so their
+    presence is a reason not to use it.
     """
     n = names_for(prefix)
     xc = inputs["xc"]
@@ -271,7 +331,9 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
     hc = svc.get("health_check") or {}
 
     buckets, warnings = _endpoint_buckets(inputs, n["dg_ep_prefix"], merge_op)
-    entry = _entrypoint_records(inputs)
+    entrypoints = [p for p in (entrypoints or []) if (p or "").strip()]
+    entry = _entrypoint_records(entrypoints, entrypoint_methods)
+    entrypoints_mapped = bool(entrypoints)
 
     # Bot Defense's egress addresses, from the infra object. These are what make
     # the return-traffic rule trustworthy: the shape-header alone is a value any
@@ -295,13 +357,17 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
                    "it are served by the Bot Defense service, not the app.",
         "records": [(js["match_path"], "")],
     })
-    if entry:
-        datagroups.append({
-            "name": n["dg_entry"],
-            "purpose": "Entrypoints: paths whose HTML response gets the <script> "
-                       "injected. Key = path (lowercase), value = methods.",
-            "records": entry,
-        })
+    datagroups.append({
+        "name": n["dg_entry"],
+        "purpose": "Entrypoints: paths whose HTML response gets the <script> "
+                   "injected. Key = path (lowercase), value = methods. "
+                   "MAINTAINED BY HAND -- XC does not record which pages need "
+                   "the script, so this is the one data group nothing "
+                   "regenerates for you."
+                   + ("" if entrypoints_mapped else
+                      " Currently the '/' catch-all: every HTML response."),
+        "records": entry,
+    })
     for b in buckets:
         datagroups.append({
             "name": b["dg"],
@@ -389,18 +455,38 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
             f"value any client can set, so a crafted request carrying it will "
             f"skip Bot Defense. Check the Bot Infrastructure in XC and re-run "
             f"fetch to pick the addresses up.")
-    if not entry:
+    if not entrypoints_mapped:
         warnings.append(
-            "The policy has no GET_DOCUMENT endpoint, so no entrypoint was "
-            "derived and the <script> would never be injected. Add an "
-            "entrypoint in XC, or pass --entrypoint PATH.")
-    for path, _ in entry:
-        if path == "/":
-            warnings.append(
-                "Entrypoint '/' is matched with `contains`, so every path "
-                "contains it and the HTML profile is enabled on all HTML "
-                "responses. That is what the XC policy asks for; narrow the "
-                f"{n['dg_entry']} data-group if you want a tighter scope.")
+            f"Entrypoints are not mapped, so {n['dg_entry']} holds the single "
+            f"record '/'. The iRule matches entrypoints with `contains` and "
+            f"every path contains '/', so the <script> is injected into EVERY "
+            f"HTML response this virtual server returns and the HTML parser "
+            f"runs over the whole application. Deliberate default: it cannot "
+            f"miss a page. The pages that actually need it are the ones "
+            f"carrying a form (or JS) that fires a protected endpoint -- XC "
+            f"does not record which those are, so nothing can derive them. "
+            f"Once you know them, re-run with --entrypoint PATH per page, or "
+            f"add the records and delete '/' with tmsh.")
+    elif any(path == "/" for path, _ in entry):
+        warnings.append(
+            f"One of the entrypoints given is '/', matched with `contains`, so "
+            f"it is true of every path -- the rest of the {n['dg_entry']} "
+            f"records make no difference and the <script> goes into every HTML "
+            f"response. Drop the '/' record if that is not what you want.")
+    for name, cmds in (pool_selecting_irules or []):
+        warnings.append(
+            f"iRule '{name}' on {vs} selects a destination itself "
+            f"({', '.join(cmds)}), and an iRule beats an LTM policy's forward "
+            f"action at every HTTP_REQUEST priority. For the requests it "
+            f"touches this whole steering policy is bypassed: protected "
+            f"endpoints reach the application uninspected, with a green pool "
+            f"and a policy hit counter that still increments. WITH A "
+            f"CONDITIONAL POOL SELECTION ALREADY ON THIS VS, THE LTM POLICY "
+            f"APPROACH IS NOT RECOMMENDED -- use F5's currently validated "
+            f"Shape connector iRule instead, which steers in TCL where it can "
+            f"be ordered against '{name}' rather than competing with it. If "
+            f"you keep the policy, guard '{name}' so it returns early on the "
+            f"paths this policy steers, starting with the telemetry JS.")
     for u in inputs.get("unsupported_endpoints", []):
         warnings.append(f"Endpoint '{u['name']}' not generated -- {u['reason']}")
     if inputs.get("mobile_endpoint_count"):
@@ -434,6 +520,10 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
         "partition": partition,
         "shape_header": shape_header,
         "names": n,
+        # False = nobody mapped the entrypoints, so the data group is the "/"
+        # catch-all. The renderers say so rather than presenting it as derived.
+        "entrypoints_mapped": entrypoints_mapped,
+        "pool_selecting_irules": list(pool_selecting_irules or []),
         "monitor": {
             "name": n["monitor"], "interval": 5, "timeout": 16,
             "send": f"GET {hc.get('path', '/sedcloudapi/health')} HTTP/1.1\\r\\n"
@@ -506,9 +596,19 @@ def render_ui(plan: dict) -> str:
         for w in plan["warnings"]:
             A(f"> - {w}")
         A("")
-    A("All navigation below is from the BIG-IP Configuration utility. Steps 1–7 "
-      "create objects and change nothing about live traffic; **step 8 is the "
-      "only step that affects the virtual server**.")
+    attach_step = 9 if plan["oneconnect"] else 8
+    A(f"All navigation below is from the BIG-IP Configuration utility. Steps "
+      f"1–{attach_step - 1} create objects and change nothing about live "
+      f"traffic; **step {attach_step} is the only step that affects the "
+      f"virtual server**.")
+    A("")
+    A(f"> **Before you start** — if any iRule already on `{plan['vs']}` selects "
+      f"a pool (`pool`, `node`, `virtual`, `LB::reselect`), it will override "
+      f"this policy for the requests it touches, at any iRule priority. Those "
+      f"requests reach the application without Bot Defense seeing them, and "
+      f"nothing reports it. Check the **Resources** tab first; where that is "
+      f"the case, F5's validated Shape connector iRule is the better fit than "
+      f"this policy.")
     A("")
 
     step = 1
@@ -556,13 +656,23 @@ def render_ui(plan: dict) -> str:
     A(f"## Step {step} — Data groups")
     A("")
     A("**Local Traffic ›› iRules ›› Data Group List ›› Create** — one per table, "
-      "all of type **String**.")
+      "all of type **String** except where noted.")
     A("")
     for dg in plan["datagroups"]:
-        A(f"### `{dg['name']}`")
+        A(f"### `{dg['name']}`" + ("  *(type **Address**)*"
+                                   if dg.get("type") == "ip" else ""))
         A("")
         A(dg["purpose"])
         A("")
+        if dg["name"] == n["dg_entry"] and not plan["entrypoints_mapped"]:
+            A("This is the one table to revisit. `/` is a catch-all: the iRule "
+              "matches entrypoints with `contains`, so every path matches and "
+              "the `<script>` is injected into every HTML response. The pages "
+              "that actually need it are the ones carrying a form (or JS) that "
+              "fires a protected endpoint. XC does not record which those are, "
+              "so map them against the application, add one record per page, "
+              "then delete the `/` record.")
+            A("")
         A("| String | Value |")
         A("|---|---|")
         for k, v in dg["records"]:
@@ -691,8 +801,14 @@ def render_ui(plan: dict) -> str:
       f"`{plan['policy']['name']}` into *Enabled*.")
     nth += 1
     A(f"{nth}. **Resources** tab: under **iRules**, click **Manage…** and move "
-      f"`{plan['irule']['name']}` into *Enabled*. Order matters only if you have "
-      f"other iRules touching `HTML::` or the response.")
+      f"`{plan['irule']['name']}` into *Enabled*. Order matters only against "
+      f"other iRules touching `HTML::` or the response — the generated iRule "
+      f"sets no pool, so it never competes for the forwarding decision.")
+    A("")
+    A(f"While you are on that tab, read the iRules already listed. Any of them "
+      f"that runs `pool`, `node`, `virtual` or `LB::reselect` wins over "
+      f"`{plan['policy']['name']}` for the requests it touches, whatever the "
+      f"order — see the note at the top of this document.")
     A("")
 
     step += 1
@@ -816,6 +932,8 @@ def _policy_block(plan: dict) -> str:
 
 def render_tmsh(plan: dict) -> str:
     m, n = plan["meta"], plan["names"]
+    total = 10 if plan["oneconnect"] else 9
+    attach = total - 1
     L = []
     A = L.append
     A("#!/bin/bash")
@@ -833,8 +951,17 @@ def render_tmsh(plan: dict) -> str:
     A("#  Or copy the text inside each  tmsh -c '...'  into an interactive tmsh")
     A("#  shell, one step at a time.")
     A("#")
-    A("#  Steps 1-7 only create objects -- live traffic is untouched until")
-    A("#  STEP 8 attaches them to the virtual server.")
+    A(f"#  Steps 1-{attach - 1} only create objects -- live traffic is "
+      f"untouched until")
+    A(f"#  STEP {attach} attaches them to the virtual server.")
+    A("#")
+    A(f"#  BEFORE STEP {attach}: check what {plan['vs']} already runs.")
+    A(f"#    tmsh list ltm virtual {plan['vs']} rules")
+    A("#  Any iRule there that runs pool / node / virtual / LB::reselect")
+    A("#  overrides this policy for the requests it touches, at every iRule")
+    A("#  priority. Those requests reach the application uninspected while the")
+    A("#  pool stays green. Where that is the case, F5's validated Shape")
+    A("#  connector iRule is the better fit than this policy.")
     if plan["warnings"]:
         A("#")
         A("#  NOTE:")
@@ -847,7 +974,7 @@ def render_tmsh(plan: dict) -> str:
     A('trap "rm -rf $TMP" EXIT')
     A("")
 
-    step, total = 1, 10 if plan["oneconnect"] else 9
+    step = 1
 
     A(f'echo "== STEP {step}/{total} -- health monitor {plan["monitor"]["name"]} =="')
     mon = plan["monitor"]
@@ -866,8 +993,14 @@ def render_tmsh(plan: dict) -> str:
 
     step += 1
     A(f'echo "== STEP {step}/{total} -- data groups =="')
-    A("# Edit these later with:")
-    A(f"#   tmsh modify ltm data-group internal {n['dg_js']} records add {{ /path {{ }} }}")
+    A(f"# {n['dg_entry']} is the one you will keep editing: XC does not say")
+    A("# which pages need the telemetry script, so it is maintained by hand.")
+    A(f"#   tmsh modify ltm data-group internal {n['dg_entry']} records add "
+      f"{{ /login {{ data GET }} }}")
+    if not plan["entrypoints_mapped"]:
+        A("# ...and once the real pages are in, drop the catch-all:")
+        A(f"#   tmsh modify ltm data-group internal {n['dg_entry']} records "
+          f"delete {{ / }}")
     for dg in plan["datagroups"]:
         A(f"#  {dg['name']}: {dg['purpose']}")
         A(f"tmsh -c 'create ltm data-group internal {dg['name']} "
@@ -958,6 +1091,11 @@ def render_tmsh(plan: dict) -> str:
     A(f"EXISTING=$(tmsh -c 'list ltm virtual {plan['vs']} rules one-line' "
       f"| sed -n 's/.*rules {{\\([^}}]*\\)}}.*/\\1/p')")
     A(f'echo "  existing iRules on {plan["vs"]}: ${{EXISTING:-<none>}}"')
+    A('if [ -n "$EXISTING" ]; then')
+    A('  echo "  ^^ if any of those runs pool / node / virtual / LB::reselect,"')
+    A(f'  echo "     it overrides {plan["policy"]["name"]} for the requests it'
+      f' touches."')
+    A('fi')
     profiles = [plan["html_profile"]["name"]]
     if plan["oneconnect"]:
         profiles.append(plan["oneconnect"]["name"])
@@ -1107,6 +1245,18 @@ def render_as3(plan: dict) -> str:
         f"not AS3-managed, and AS3 will not modify objects it does not own. "
         f"Attach with the three tmsh commands in the tmsh artifact (STEP 8), or "
         f"move the VS into AS3.",
+        f"{n['dg_entry']} is maintained by hand -- XC does not record which "
+        f"pages need the telemetry script. AS3 owns this data group once "
+        f"deployed, so a later redeploy REVERTS records added with tmsh or the "
+        f"GUI. Keep the entrypoint list in this declaration (or in the "
+        f"--entrypoint flags that generate it), not on the box."
+        + ("" if plan["entrypoints_mapped"] else
+           " It currently holds only the '/' catch-all, which injects into "
+           "every HTML response."),
+        f"If any iRule already on {plan['vs']} selects a pool, it overrides "
+        f"{n['policy']} for the requests it touches at every iRule priority, "
+        f"and this declaration cannot see that -- it does not read the VS. "
+        f"Check `tmsh list ltm virtual {plan['vs']} rules` before attaching.",
         "AS3's forward action has no fallback-pool equivalent, so the per-rule "
         "fallback to "
         + (plan["default_pool"] if plan["default_pool"]

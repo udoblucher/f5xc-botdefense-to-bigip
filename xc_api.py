@@ -37,9 +37,14 @@ from rest import request_json
 
 SCHEMA = "xcbot/1"
 
-# XC BP_METHOD_* -> (HTTP verb, is a JS-injection entrypoint).
-# GET_DOCUMENT is XC's marker for "a browser asking for an HTML document",
-# which is exactly where the telemetry <script> has to be injected.
+# XC BP_METHOD_* -> (HTTP verb, is GET_DOCUMENT).
+#
+# GET_DOCUMENT means "this protected endpoint is expected to serve an HTML
+# document". It is NOT the list of pages the telemetry <script> goes into, even
+# though it reads like it: injection belongs on whatever page carries the form
+# or JS that later calls a protected endpoint, and that page is usually not a
+# protected endpoint itself. The flag is carried through to the inputs file as
+# information; the injection list is asked for at build time instead.
 _METHODS = {
     "BP_METHOD_GET":          ("GET", False),
     "BP_METHOD_GET_DOCUMENT": ("GET", True),
@@ -135,7 +140,8 @@ class XC:
     def __init__(self, tenant: str, token: str, verify_tls: bool = True):
         if not token:
             raise RuntimeError(
-                "No XC API token. Set F5XC_API_TOKEN, or pass --token-file.")
+                "No XC API token. Put one in xc_api_token.txt (xcbot.py fetch "
+                "creates the file), or pass --token-file PATH.")
         self.tenant = tenant
         self.token = token
         self.verify_tls = verify_tls
@@ -277,15 +283,15 @@ def normalize(tenant: str, ns: str, infra_name: str,
             unsupported.append({"name": name,
                                 "reason": "no usable path matcher after validation"})
             continue
-        methods, entrypoint = [], False
+        methods, get_document = [], False
         for m in (ep.get("http_methods") or []):
             verb, is_doc = _METHODS.get(m, (None, False))
             if verb:
-                entrypoint = entrypoint or is_doc
+                get_document = get_document or is_doc
                 if verb not in methods:
                     methods.append(verb)
         endpoints.append({"name": name, "methods": methods,
-                          "entrypoint": entrypoint, "combine": combine,
+                          "get_document": get_document, "combine": combine,
                           "matches": matches})
 
     mobile = len(((content.get("protected_mobile_endpoints") or {})

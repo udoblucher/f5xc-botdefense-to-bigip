@@ -8,7 +8,8 @@ it into whichever form of BIG-IP configuration you need:
 3. **An AS3 declaration** for automation
 
 ```bash
-export F5XC_API_TOKEN=...
+python3 xcbot.py fetch --tenant acme          # creates xc_api_token.txt, then
+                                              # asks you to paste your token in
 python3 xcbot.py fetch --tenant acme --namespace bot-defense \
                        --infra my-bot-infra
 python3 xcbot.py build --vs secureapp
@@ -16,6 +17,28 @@ python3 xcbot.py build --vs secureapp
 
 Python 3.7+ standard library only — no `requests`, so it also runs on a stock
 BIG-IP.
+
+### The API token
+
+`fetch` reads it from `xc_api_token.txt` in the working directory. Run `fetch`
+with no token anywhere and it creates that file (mode `0600`) with a placeholder
+and tells you what to do:
+
+```
+# F5 Distributed Cloud API token, read by xcbot.py fetch.
+#
+# Replace the last line of this file with your token. Get one in the XC console:
+#   Administration >> Personal Management >> Credentials >> Add Credentials
+#   Credential type: API Token
+...
+PASTE_YOUR_XC_API_TOKEN_HERE
+```
+
+Comment lines are kept, so the file explains itself when you come back to it in
+six months. It is gitignored; `xc_api_token.txt.example` is the committed copy.
+
+`--token-file PATH` reads a different file. `F5XC_API_TOKEN` still works and is
+checked last, for CI. `build` needs no token at all.
 
 ---
 
@@ -25,8 +48,9 @@ BIG-IP.
 and the Bot Endpoint Policy it references, normalizes them, and writes
 `botdefense_inputs.json`.
 
-**`build`** reads that file, asks what it cannot know — which virtual server —
-and writes the artifacts. It needs no credentials and no network.
+**`build`** reads that file, asks what it cannot know — which virtual server, and
+which pages get the injected script — and writes the artifacts. It needs no
+credentials and no network.
 
 The split is the point: the same inputs file always produces the same config, so
 you can commit it, diff it against last week's, and review it as the record of
@@ -145,9 +169,64 @@ regardless; the fallback pool only covers the narrower case where a rule *does*
 match but the bot pool has no available member.
 
 **Injection** — an HTML profile plus an iRule. The `<script>` goes into `<head>`,
-but only on *entrypoints*: the endpoints XC marks `GET_DOCUMENT`. The iRule
-calls `HTML::disable` on every response and re-enables it per request, so the
-HTML parser never runs on API or asset traffic.
+but only on *entrypoints*, which are listed in a data group. The iRule calls
+`HTML::disable` on every response and re-enables it per request, so the HTML
+parser never runs on traffic that does not need it.
+
+#### Entrypoints are not fetched — they are yours to map
+
+This is the one part of the config XC cannot supply. The policy records which
+endpoints are **protected**; it does not record which pages have to **carry the
+script**. Those are different things: the script belongs on the page holding the
+form (or the JS) that later calls a protected endpoint, and that page is usually
+not itself a protected endpoint. `GET_DOCUMENT` looks like the answer and is not
+— it marks endpoints XC expects to serve an HTML document, which is a claim
+about the endpoint, not an injection site.
+
+So `build` asks:
+
+```
+JS injection scope
+  The telemetry <script> belongs on the pages carrying a form (or
+  JS) that fires a protected endpoint. XC does not record which
+  pages those are, so it cannot be fetched -- either you have
+  mapped them, or the script goes into every HTML response.
+
+Have the entrypoint pages been mapped?
+  1. No  -- inject across the whole application (data group gets '/')   (default)
+  2. Yes -- type the entrypoint paths now
+```
+
+Answer **no** and `bot-defense-entrypoint` gets one record, `/`. The iRule
+matches entrypoints with `contains` and every path contains `/`, so every HTML
+response is decorated — the whole application, and the HTML parser armed on all
+of it. Wide, but it cannot miss a page, which is the right way round for a
+default. You get a warning in every artifact saying exactly that.
+
+Answer **yes**, or pass `--entrypoint` once per page:
+
+```bash
+python3 xcbot.py build --vs secureapp --entrypoint /login --entrypoint /account/transfer
+```
+
+`--entrypoint-methods` sets the methods recorded against each (default `GET` —
+injection happens on the document request). Paths are validated the same way XC
+paths are, and anchored with a leading `/`.
+
+**This data group is maintained by hand from then on.** Nothing regenerates it,
+because nothing knows the answer. Add pages as you map them:
+
+```bash
+tmsh modify ltm data-group internal bot-defense-entrypoint records add { /login { data GET } }
+tmsh modify ltm data-group internal bot-defense-entrypoint records delete { / }   # drop the catch-all
+```
+
+A specific record wins over the catch-all while both are present — with `/` and
+`/login { data GET,POST }` in the group, `/login` resolves to `GET,POST`. So you
+can add pages first and delete `/` last, without a gap in coverage. One
+exception to the hand-editing: **AS3 owns the data group once you deploy the
+declaration**, so a redeploy reverts records added with tmsh or the GUI. Keep
+the list in the `--entrypoint` flags that generate the declaration instead.
 
 ### Objects created
 
@@ -159,7 +238,7 @@ With the default `--prefix bot-defense`:
 | `ltm pool` | `bot-defense-pool` | infra `cloud_hosted.infra_host_name`, as an auto-populating FQDN member |
 | `ltm data-group` (`ip`) | `bot-defense-egress` | infra `cloud_hosted.egress[].ip_address` |
 | `ltm data-group` | `bot-defense-js` | `js_download_path`, query stripped |
-| `ltm data-group` | `bot-defense-entrypoint` | `GET_DOCUMENT` endpoints; value holds the methods |
+| `ltm data-group` | `bot-defense-entrypoint` | **you** — `--entrypoint`, or `/` for everything; value holds the methods |
 | `ltm data-group` | `bot-defense-endpoints-<method>-<op>[-ci][-not]` | protected endpoint paths |
 | `ltm html-rule` | `bot-defense-js-rule` | `js_download_path`, query kept |
 | `ltm profile html` | `bot-defense-js-profile` | — |
@@ -198,6 +277,18 @@ you would rather curate one list per method by hand than track what XC says.
 
 ### Coexisting with existing iRules
 
+> **If the target virtual server already has an iRule that conditionally selects
+> a pool, this LTM policy approach is not recommended.** Use F5's currently
+> validated Shape connector iRule instead: it steers in TCL, where it can be
+> *ordered* against your existing logic rather than competing with it. The rest
+> of this section is why, and what to do if you keep the policy anyway.
+
+`build` checks for this when you pass `--bigip`: it reads the iRules attached to
+the virtual server, scans each body for `pool`, `node`, `virtual`, `LB::reselect`
+and `LB::detach`, and names any that match in a warning carried into every
+artifact. Without `--bigip` it cannot look, so the generated GUI walkthrough and
+tmsh script both open with a "check this first" note and the command to run.
+
 **An iRule's `pool` command beats the LTM policy's forward action, and iRule
 priority does not change that.** Verified on 17.5.1 with three pools — one on the
 virtual server, one selected by a policy rule, one selected by an iRule — logging
@@ -233,7 +324,14 @@ bypassed**:
 
 Three ways out, best first:
 
-1. **Guard the existing iRule** so it defers on Bot Defense's paths:
+1. **Steer in an iRule instead of the policy** — F5's validated Shape connector.
+   This is exactly why F5's own AVK connector selects its pool in an iRule at
+   `HTTP_REQUEST priority 999` rather than using an LTM policy: two iRules can be
+   ordered against each other, an iRule and a policy cannot. Nothing competes in
+   the first place. This is the recommendation whenever a conditional pool
+   selection is already in play.
+2. **Guard the existing iRule** so it defers on Bot Defense's paths. Workable if
+   you own that iRule and its conditions are narrow:
 
    ```tcl
    when HTTP_REQUEST {
@@ -243,9 +341,8 @@ Three ways out, best first:
    }
    ```
 
-2. **Move steering into an iRule** instead of the policy. This is exactly why
-   F5's own AVK connector selects its pool in an iRule at `HTTP_REQUEST priority
-   999` rather than using an LTM policy — it never competes in the first place.
+   Note this only defers on the telemetry JS. Every path the policy's endpoint
+   rules steer needs the same treatment, which is why option 1 scales better.
 3. **Drop the conflicting logic** if the policy can express it.
 
 The generated iRule sets **no** pool — only `HTML::enable`/`disable` and
@@ -340,6 +437,7 @@ saves. A rollback command list is in the footer of every generated script.
 | `render.py` | `build_plan()` and the three renderers |
 | `bigip_api.py` | BIG-IP discovery and deploy |
 | `rest.py` | stdlib HTTP |
+| `xc_api_token.txt.example` | the placeholder token file, copied to `xc_api_token.txt` on first run |
 
 `build_plan()` makes every decision; the renderers only describe the plan. That
 is what keeps the GUI steps, the tmsh script and the AS3 declaration from
@@ -351,6 +449,8 @@ drifting apart. Add a decision there, never in a renderer.
 
 | Option | |
 |---|---|
+| `--entrypoint` | page whose HTML gets the `<script>`; repeat per page. Omitted → `/`, i.e. everything |
+| `--entrypoint-methods` | methods recorded against each entrypoint (default `GET`) |
 | `--default-pool` | override the `fallback-pool`; normally read off the VS at run time |
 | `--merge-ops` | one data group + rule per method, at the cost of fidelity (see above) |
 | `--oneconnect-mask` | OneConnect source mask (default `255.255.255.255`; `""` skips the profile) |
@@ -361,7 +461,7 @@ drifting apart. Add a decision there, never in a renderer.
 | `--out-dir` | default `out/` |
 | `--partition` | BIG-IP partition the VS lives in (default `Common`) |
 | `--raw` | on `fetch`, also save the unmodified XC responses |
-| `--token-file` | read the API token from a file instead of `F5XC_API_TOKEN` |
+| `--token-file` | read the API token from a different file than `./xc_api_token.txt` |
 | `--policy` | on `fetch`, fail if the infra runs a different policy than expected |
 | `--verify-bigip-tls` | verify the BIG-IP certificate (off by default — it is self-signed) |
 
@@ -378,10 +478,13 @@ Fetching a policy without one would give you endpoints with nowhere to send them
 - **`path_and` and `path_none` endpoints are skipped**, with a named warning in
   every artifact. Neither has a single-rule LTM policy equivalent. `path_or` and
   `all_path` are handled.
-- **An entrypoint of `/` matches everything.** The iRule tests entrypoints with
-  `contains`, so a `/` record enables the HTML profile on all HTML responses.
-  That is what an XC policy with an `ends-with /` document endpoint is asking
-  for; narrow the data group if you want a tighter scope. You get a warning.
+- **Entrypoints default to `/`, which means everything.** The iRule tests
+  entrypoints with `contains`, so a `/` record enables the HTML profile on every
+  HTML response. That is the deliberate fallback for "nobody has mapped the
+  pages yet" — it cannot miss one. Verified on 17.5.1: with a `/` record,
+  `class match -value -- /static/app.css contains <dg>` returns the record's
+  value. You get a warning until you pass `--entrypoint`. See
+  [Entrypoints are not mapped for you](#entrypoints-are-not-fetched--they-are-yours-to-map).
 - **Endpoints XC disables are skipped**, reported by name — `metadata.disable`
   is honoured rather than silently generating a rule for a switched-off endpoint.
 - **A `/` record under `contains` or `starts-with` disables the filter.** It is
@@ -401,6 +504,8 @@ Fetching a policy without one would give you endpoints with nowhere to send them
   built from the policy's current content; a mismatch is warned about, naming
   both versions.
 - **An existing iRule that sets a pool silently defeats the whole policy** for
-  the requests it touches. See
+  the requests it touches, and where one exists the policy approach is not the
+  right tool — use F5's validated Shape connector iRule. Detected and named when
+  you pass `--bigip`. See
   [Coexisting with existing iRules](#coexisting-with-existing-irules) — this is
   the one to check before rolling onto a virtual server someone else built.
