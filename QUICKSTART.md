@@ -26,6 +26,7 @@ iRules](README.md#coexisting-with-existing-irules).
 | API token | Administration ▸ Personal Management ▸ Credentials ▸ Add Credentials, type **API Token**. |
 | Permissions | Read on the namespace's Bot Defense objects (`/api/shape/bot/...`) and on `/api/web/namespaces` for the namespace pick-list. Read-only is enough — this tool never writes to XC. |
 | Objects | A **Bot Infrastructure** in `REVERSE_PROXY` mode, with a **Bot Endpoint Policy** attached. Any other mode still builds, but warns — the steering design assumes reverse proxy and is wrong for anything else. |
+| Hostname | Bot Defense must be configured for the hostname your users reach the virtual server on. Protected endpoints are proxied to the service by `Host` header; a host it does not know gets a **404**, and the 404 is what your users see. |
 
 **On the BIG-IP**
 
@@ -34,6 +35,7 @@ iRules](README.md#coexisting-with-existing-irules).
 | Modules | LTM provisioned. Nothing else — Bot Defense evaluation happens in XC, not here. |
 | Access | `admin`/root for tmsh, or an Administrator-role account for REST. |
 | Virtual server | The VS you are protecting must already exist and have an **HTTP profile** — the LTM policy matches on HTTP, and the HTML profile cannot attach without one. |
+| …and SSL | It must also have a **SERVERSSL, CLIENTSSL or PERSIST** profile, or tmsh refuses the attach with `01071912:3`. Not a formality: the bot pool member is port **443**, so without serverssl the BIG-IP would send cleartext to a TLS port and the service would answer 400. A Bot Defense VS is normally HTTPS and already has one. |
 | DNS | A resolver must be configured: the generated bot pool member is the Bot Defense service **FQDN**, not an IP. |
 | Egress | Outbound 443 from the BIG-IP to that service host. |
 | Version | Verified on **17.5.1**. Everything generated (LTM policies, data groups, HTML profiles, OneConnect) is long-standing LTM, but 17.5.1 is the only version this has been run against. |
@@ -144,6 +146,14 @@ Non-negotiable, and it takes two minutes:
   second-to-last step; everything before it only creates objects. Nothing else
   in the script touches the VS.
 
+That step is a single `tmsh modify` carrying the profiles, the policy and the
+iRule together, because tmsh applies a combined `modify` as one transaction. If
+it is refused — the usual reason being the missing SSL profile above — the
+virtual server is left exactly as it was. Verified on 17.5.1. Do not split it
+into separate commands when you run it by hand: a failure part-way through
+leaves the policy steering traffic at the bot pool with no iRule, and the VS
+answers 400.
+
 ## Step 7 — apply it
 
 Three ways, pick one:
@@ -222,6 +232,9 @@ objects afterwards is housekeeping.
 | `fetch` prompts for nothing and exits | `--yes` with a missing option. Drop `--yes` to be asked. |
 | `build` warns that the deployment mode is not `REVERSE_PROXY` | It still writes the artifacts, but do not use them: the whole steering design assumes reverse proxy. Fix the infra in XC. |
 | `01020036:3 ... was not found` running the script | A partition mismatch: the VS is not in `--partition`. Name it as `/partition/name`. |
+| `01071912:3 SSL::disable ... requires an associated SERVERSSL or CLIENTSSL or PERSIST profile` | The VS has none. Nothing was applied — the attach is one transaction — so the VS is untouched and you can fix it and re-run just that step. See the requirements table. |
+| `01020066:3 ... policy already exists` | The attach ran before. Nothing was applied. Detach first if you are re-running it. |
+| Protected endpoints return 404 | Bot Defense does not recognise the `Host` your users send. Fix it in XC; the BIG-IP side is working. Unprotected paths still reach the application, which is what makes this one easy to misread. |
 | `01071912:3 HTML::disable ... requires an associated HTML profile` | You are detaching in the wrong order, or the VS never got the HTML profile. iRule off first. |
 | Protected endpoints hang | The loop guard is not matching. See step 8. |
 | Pool down | DNS resolver, then egress 443 to the service FQDN. |

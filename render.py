@@ -850,13 +850,28 @@ def render_ui(plan: dict) -> str:
         A(f"{nth}. **Properties** tab (Advanced): set **OneConnect Profile** to "
           f"`{plan['oneconnect']['name']}`. Update.")
     nth += 1
-    A(f"{nth}. **Resources** tab: under **Policies**, click **Manage…** and move "
-      f"`{plan['policy']['name']}` into *Enabled*.")
-    nth += 1
     A(f"{nth}. **Resources** tab: under **iRules**, click **Manage…** and move "
       f"`{plan['irule']['name']}` into *Enabled*. Order matters only against "
       f"other iRules touching `HTML::` or the response — the generated iRule "
       f"sets no pool, so it never competes for the forwarding decision.")
+    nth += 1
+    A(f"{nth}. **Resources** tab: under **Policies**, click **Manage…** and move "
+      f"`{plan['policy']['name']}` into *Enabled*. **Last, and deliberately so** "
+      f"— see below.")
+    A("")
+    # The GUI cannot do this as one write the way tmsh can, so the order is the
+    # only protection available: the policy is what steers traffic at the bot
+    # pool, and the iRule is what scopes injection and turns serverssl off for
+    # the application pool. Enabling the policy last means every step that can
+    # be refused has already been taken, with live traffic still untouched.
+    A(f"Each of those is a separate save, so unlike the tmsh script this cannot "
+      f"be applied as one transaction. That is why `{plan['policy']['name']}` "
+      f"goes last: it is the step that starts steering traffic, and everything "
+      f"that might be refused happens before it. If step {nth - 1} fails with "
+      f"`SSL::disable in rule (...) requires an associated SERVERSSL or "
+      f"CLIENTSSL or PERSIST profile`, give the virtual server one and retry — "
+      f"the bot pool member is on 443, so it is needed regardless. Stop there; "
+      f"do not enable the policy without the iRule.")
     A("")
     A(f"While you are on that tab, read the iRules already listed. Any of them "
       f"that runs `pool`, `node`, `virtual` or `LB::reselect` wins over "
@@ -1005,8 +1020,7 @@ def render_tmsh(plan: dict) -> str:
 
     vsq = q(plan["vs"])
     total = 10 if plan["oneconnect"] else 9
-    if in_partition:
-        total += 1          # preflight
+    total += 1              # preflight, always: see below
     attach = total - 1
     L = []
     A = L.append
@@ -1052,25 +1066,24 @@ def render_tmsh(plan: dict) -> str:
 
     step = 1
 
+    # Everything after this creates objects. A name that does not resolve is
+    # worth catching before the first of them exists, not nine steps later.
+    A(f'echo "== STEP {step}/{total} -- preflight =="')
     if in_partition:
-        # Everything below names objects absolutely, so a missing partition or a
-        # VS that is not in it fails one command at a time and leaves the rest
-        # half-applied. Cheaper to stop here.
-        A(f'echo "== STEP {step}/{total} -- preflight: partition {part} =="')
         A(f"tmsh -c 'list auth partition {part}' >/dev/null 2>&1 || {{")
         A(f'  echo "  partition {part} does not exist on this BIG-IP." >&2')
         A(f'  echo "  Create it first:  tmsh create auth partition {part}" >&2')
         A("  exit 1")
         A("}")
-        A(f"tmsh -c 'list ltm virtual {vsq}' >/dev/null 2>&1 || {{")
-        A(f'  echo "  no virtual server {vsq}." >&2')
-        A(f'  echo "  Check the name and partition:  tmsh -c \'cd /{part};'
-          f' list ltm virtual\'" >&2')
-        A("  exit 1")
-        A("}")
-        A(f'echo "  {part} exists, {vsq} found"')
-        A("")
-        step += 1
+    A(f"tmsh -c 'list ltm virtual {vsq}' >/dev/null 2>&1 || {{")
+    A(f'  echo "  no virtual server {vsq}." >&2')
+    A(f'  echo "  Check the name and partition:  tmsh -c \'cd /{part};'
+      f' list ltm virtual\'" >&2')
+    A("  exit 1")
+    A("}")
+    A(f'echo "  {vsq} found"')
+    A("")
+    step += 1
 
     A(f'echo "== STEP {step}/{total} -- health monitor {q(plan["monitor"]["name"])} =="')
     mon = plan["monitor"]
@@ -1204,19 +1217,28 @@ def render_tmsh(plan: dict) -> str:
     profiles = [q(plan["html_profile"]["name"])]
     if plan["oneconnect"]:
         profiles.append(q(plan["oneconnect"]["name"]))
-    A(f"tmsh -c 'modify ltm virtual {vsq} profiles add "
-      f"{{ {' '.join(profiles)} }}'")
-    A(f"tmsh -c 'modify ltm virtual {vsq} policies add "
-      f"{{ {q(plan['policy']['name'])} }}'")
+    irule = q(plan["irule"]["name"])
     # tmsh prints attached iRules with the same absolute names it accepts, so
     # the already-attached test compares like with like.
     A(f'case " $EXISTING " in')
-    A(f'  *" {q(plan["irule"]["name"])} "*)')
-    A(f'    echo "  {q(plan["irule"]["name"])} is already attached, leaving rules alone" ;;')
-    A(f'  *)')
-    A(f"    tmsh -c \"modify ltm virtual {vsq} rules "
-      f"{{ $EXISTING {q(plan['irule']['name'])} }}\" ;;")
-    A(f'esac')
+    A(f'  *" {irule} "*)')
+    A(f'    echo "  {irule} is already attached, leaving the rule list alone"')
+    A('    RULES="$EXISTING" ;;')
+    A(f'  *) RULES="$EXISTING {irule}" ;;')
+    A('esac')
+    # One modify, not three. tmsh applies a combined modify as a single
+    # transaction (measured on 17.5.1), so if any part of it is refused none
+    # of it is applied and the virtual server is left exactly as it was. The
+    # refusal to expect is '01071912:3: SSL::disable in rule (...) requires an
+    # associated SERVERSSL or CLIENTSSL or PERSIST profile' on a VS that has
+    # none. Issued as three separate calls, that same failure would leave the
+    # policy already steering matched requests at the bot pool with no iRule
+    # to scope them -- and since the bot pool member is :443 and nothing had
+    # turned serverssl off for the application pool, the VS would answer 400.
+    A(f"tmsh -c \"modify ltm virtual {vsq}"
+      f" profiles add {{ {' '.join(profiles)} }}"
+      f" policies add {{ {q(plan['policy']['name'])} }}"
+      f" rules {{ $RULES }}\"")
     A("")
 
     step += 1

@@ -306,10 +306,11 @@ differently:
 - **The tmsh script** names everything absolutely (`/prod/bot-defense-pool`). It
   has to: a bare name resolves in the *current* folder, which for a root shell is
   `/Common`, so `modify ltm virtual shop` on a VS in `/prod` fails with
-  `01020036:3: The requested Virtual Server (/Common/shop) was not found`. The
-  script also gains a **preflight step** that exits before creating anything if
-  the partition does not exist or the VS is not in it — otherwise a typo leaves
-  a half-applied config, with the objects built and the attach step failing.
+  `01020036:3: The requested Virtual Server (/Common/shop) was not found`. Every
+  script opens with a **preflight step** that exits before creating anything if
+  the virtual server does not resolve — and, with `--partition`, if the
+  partition itself does not exist. Otherwise a typo leaves a half-applied
+  config, with the objects built and the attach step failing.
 - **The GUI walkthrough** keeps bare names and opens with a note to set the
   **Partition / Path** selector first. The GUI has no per-object partition field:
   objects land in whatever that selector is showing.
@@ -456,6 +457,21 @@ saves. A rollback command list is in the footer of every generated script, in
 dependency order — the iRule has to come off the virtual server *before* the
 HTML profile it calls `HTML::disable` on, or the detach is refused.
 
+The attach is deliberately **one** `tmsh modify` carrying the profiles, the
+policy and the iRule together. tmsh applies a combined `modify` as a single
+transaction, so a refusal applies none of it and leaves the virtual server as it
+was (verified on 17.5.1). Issued as three commands it is not safe: the refusal
+to expect is `01071912:3: SSL::disable in rule (...) requires an associated
+SERVERSSL or CLIENTSSL or PERSIST profile`, which lands on the *rules* command,
+after the profiles and the policy are already on. The VS is then steering
+matched requests at the bot pool with no iRule to scope them — and since the bot
+pool member is `:443` and nothing has turned serverssl off for the application
+pool, it answers 400. So: **the virtual server must already have a SERVERSSL,
+CLIENTSSL or PERSIST profile.** A Bot Defense VS is normally HTTPS and does.
+If yours is deliberately plain HTTP, it still needs serverssl for the bot pool
+leg; the iRule's `SERVER_CONNECTED` block turns it back off for the application
+pool.
+
 ### AS3 caveats
 
 - Objects go into `/<partition>/Shared/`, which is where a virtual server in that
@@ -560,6 +576,15 @@ Fetching a policy without one would give you endpoints with nowhere to send them
   dropped and reported rather than escaped four different ways.
 - **FQDN pool members need DNS** configured on the BIG-IP, and egress to the
   service on 443.
+- **A combined `tmsh modify` is atomic.** Measured on 17.5.1: one `modify ltm
+  virtual X profiles add {...} policies add {...} rules {...}` that is refused
+  applies *none* of its three parts. This is what the attach step relies on; see
+  [Deploying](#deploying).
+- **Bot Defense answers 404 for a `Host` it does not know.** Protected endpoints
+  are proxied to the service with the client's `Host` header, so an application
+  hostname that is not configured in XC returns 404 to your users — while
+  unprotected paths keep working normally, which makes it read like an
+  application bug rather than a configuration one.
 - **Rule 1 assumes Bot Defense reaches the VS directly**, so the client address
   the BIG-IP sees really is an egress IP. A SNAT or proxy in between breaks the
   match and the loop returns. F5's own AVK connector makes the same assumption

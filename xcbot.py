@@ -142,7 +142,7 @@ def _read_token_file(path: str) -> str:
     is or where it came from.
     """
     try:
-        with open(os.path.expanduser(path)) as fh:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -157,7 +157,7 @@ def _write_token_template(path: str) -> bool:
     if os.path.exists(os.path.expanduser(path)):
         return False
     try:
-        with open(os.path.expanduser(path), "w") as fh:
+        with open(os.path.expanduser(path), "w", encoding="utf-8") as fh:
             fh.write(TOKEN_TEMPLATE)
         # The file is about to hold a credential, so narrow it before it does.
         os.chmod(os.path.expanduser(path), 0o600)
@@ -261,7 +261,7 @@ def cmd_fetch(args) -> int:
 
     inputs = xc_api.normalize(args.tenant, namespace, infra, infra_obj, policy_obj)
 
-    with open(args.out, "w") as fh:
+    with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(inputs, fh, indent=2)
         fh.write("\n")
     print(f"\nWrote {args.out}", file=sys.stderr)
@@ -270,7 +270,7 @@ def cmd_fetch(args) -> int:
     if args.raw:
         for label, obj in (("infra", infra_obj), ("policy", policy_obj)):
             path = f"{args.out.rsplit('.', 1)[0]}_raw_{label}.json"
-            with open(path, "w") as fh:
+            with open(path, "w", encoding="utf-8") as fh:
                 json.dump(obj, fh, indent=2)
             print(f"Wrote {path}", file=sys.stderr)
     return 0
@@ -413,7 +413,7 @@ def cmd_build(args) -> int:
     ask = Asker(not args.yes)
 
     try:
-        with open(args.inputs) as fh:
+        with open(args.inputs, encoding="utf-8") as fh:
             inputs = json.load(fh)
     except FileNotFoundError:
         raise SystemExit(
@@ -500,7 +500,7 @@ def cmd_build(args) -> int:
 
     def write(name: str, text: str, mode: int = 0o644):
         path = os.path.join(args.out_dir, name)
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(text if text.endswith("\n") else text + "\n")
         os.chmod(path, mode)
         written.append(path)
@@ -574,7 +574,7 @@ def cmd_deploy(args) -> int:
     bip = _bigip(args, ask, required=True)
 
     if args.tmsh_file:
-        with open(args.tmsh_file) as fh:
+        with open(args.tmsh_file, encoding="utf-8") as fh:
             script = fh.read()
         print(f"About to run {args.tmsh_file} on {args.bigip}.", file=sys.stderr)
         print("It creates objects and attaches them to the virtual server.",
@@ -584,7 +584,7 @@ def cmd_deploy(args) -> int:
         print(bip.deploy_tmsh(script, os.path.basename(args.tmsh_file)))
 
     if args.as3_file:
-        with open(args.as3_file) as fh:
+        with open(args.as3_file, encoding="utf-8") as fh:
             decl = json.load(fh)
         decl.pop("_notes", None)          # our own annotation, not AS3 schema
         version = bip.as3_version()
