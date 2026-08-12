@@ -584,7 +584,7 @@ generated iRule already logs, so an existing forwarder picks it up with no new
 configuration:
 
 ```
-xcbot[12345]: policy=endpoint-web-5-2 v15.0->v16.0: 2 record change(s) staged
+xcbot[12345]: policy=my-endpoint-policy v15.0->v16.0: 2 record change(s) staged
 ```
 
 The full diff is appended to `--log-file` (default `/var/log/xcbot-sync.log`,
