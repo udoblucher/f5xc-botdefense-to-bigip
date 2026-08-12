@@ -19,6 +19,13 @@ Two commands, in the order you use them:
 
   deploy   Optional. Push an artifact that was already generated and reviewed.
 
+  sync     Optional, and meant for cron. Re-read the policy from XC, compare it
+           against the data groups as they actually are on the box, and report
+           what moved. --check stages an apply script and writes no config;
+           --apply runs that script after showing the diff and asking. Endpoint
+           changes that would need a new LTM policy rule are reported, never
+           staged -- see sync.py for why those are not the same risk.
+
 Splitting fetch from build is the point: build never needs credentials or
 network, so the same fetched file reproduces the same config, and the file can
 be committed, diffed and reviewed as the record of what XC said.
@@ -35,12 +42,15 @@ Python 3.7+ standard library only.
 from __future__ import annotations
 
 import argparse
+import datetime
 import getpass
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 
+import sync
 import xc_api
 from bigip_api import BigIP
 from rest import HTTPError
@@ -607,6 +617,215 @@ def cmd_deploy(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+def _notify(args, line: str, report: str) -> None:
+    """One syslog line, and the full diff appended to the report file.
+
+    logger, not a socket: it puts the line in /var/log/ltm beside what the
+    generated iRule already logs, so an existing forwarder picks it up with no
+    new configuration. Failure to log is never allowed to fail the run -- the
+    diff has already been printed to stdout by the time this is called.
+    """
+    try:
+        subprocess.run(["/bin/logger", "-p", "local0.notice", "-t", "xcbot",
+                        line], check=False)
+    except OSError:
+        pass                                # not a BIG-IP, or no logger
+
+    path = args.log_file
+    if not path:
+        return
+    try:
+        # Truncate rather than rotate: nothing on the box rotates a file we
+        # invent, and an unbounded log on /var is worse than a lost history.
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                keep = fh.read()[-200_000:]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"[truncated at 1MB]\n{keep}")
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {stamp}  {line}\n{report}\n")
+    except OSError as e:
+        print(f"  (could not write {path}: {e})", file=sys.stderr)
+
+
+def _sync_transport(args, ask: Asker, partition: str):
+    """REST when --bigip was given, local tmsh otherwise."""
+    if args.bigip:
+        return sync.RestTransport(_bigip(args, ask, required=True), partition)
+    if not os.path.exists("/usr/bin/tmsh") and not os.path.exists("/bin/tmsh"):
+        raise SystemExit(
+            "No --bigip given, so this expects to be running ON a BIG-IP, but "
+            "there is no tmsh here. Pass --bigip HOST to work over iControl "
+            "REST instead.")
+    return sync.LocalTransport(partition)
+
+
+def cmd_sync(args) -> int:
+    if bool(args.check) == bool(args.apply_file):
+        raise SystemExit("Pass exactly one of --check or --apply FILE.")
+    return _sync_apply(args) if args.apply_file else _sync_check(args)
+
+
+def _sync_check(args) -> int:
+    ask = Asker(not args.yes)
+    partition = (args.partition or "Common").strip("/")
+
+    if not os.path.exists(args.inputs):
+        raise SystemExit(
+            f"No {args.inputs}. sync compares XC against the box, and it takes "
+            f"the tenant, namespace and infra to ask about from the inputs file "
+            f"that 'fetch' wrote. Run fetch first, or pass --inputs PATH.")
+    with open(args.inputs, encoding="utf-8") as fh:
+        old_inputs = json.load(fh)
+    old_xc = old_inputs.get("xc") or {}
+    tenant = args.tenant or old_xc.get("tenant", "")
+    namespace = args.namespace or old_xc.get("namespace", "")
+    infra = args.infra or old_xc.get("infra", "")
+    if not (tenant and namespace and infra):
+        raise SystemExit(
+            f"{args.inputs} does not name a tenant, namespace and infra, and "
+            f"they were not passed. Re-run fetch, or pass --tenant/--namespace/"
+            f"--infra.")
+
+    # --- what XC says now
+    print(f"Checking XC '{infra}' in {tenant}/{namespace} ...", file=sys.stderr)
+    xc = xc_api.XC(tenant, _token(args), verify_tls=not args.no_verify_tls)
+    infra_obj = xc.get_infra(namespace, infra)
+    meta = ((infra_obj.get("spec") or {}).get("bot_endpoint_policy_metadata")) or {}
+    policy_name = meta.get("name") or ""
+    if not policy_name:
+        raise SystemExit(f"Infra '{infra}' references no Bot Endpoint Policy.")
+    policy_obj = xc.get_policy(namespace, policy_name)
+    new_inputs = xc_api.normalize(tenant, namespace, infra, infra_obj, policy_obj)
+
+    want, dmeta = sync.desired_state(new_inputs, args.prefix, args.merge_ops,
+                                     partition)
+    if not want:
+        raise SystemExit(
+            "The XC policy yields no data groups at all -- no protected "
+            "endpoints and no egress addresses. Nothing to compare.")
+
+    # --- what the box says now
+    transport = _sync_transport(args, ask, partition)
+    print(f"Reading data groups via {transport.label} ...", file=sys.stderr)
+    ep_prefix = dmeta["ep_prefix"]
+    # Read the union of what XC wants and what is actually there under our
+    # endpoint prefix. Looking up only the expected names would make a bucket
+    # the policy has dropped invisible -- nothing expects it, which is exactly
+    # the thing worth reporting.
+    on_box = transport.list_data_groups(ep_prefix)
+    live = transport.read_data_groups(sorted(set(want) | set(on_box)))
+
+    # A prefix that matches nothing is the difference between "XC added
+    # everything" and "you named the wrong object set". Refuse rather than
+    # report a diff that is really a typo.
+    if not any(live.get(k) is not None for k in want
+               if k.startswith(ep_prefix)):
+        raise SystemExit(
+            f"No data group under '{ep_prefix}-*' exists on the box, so there "
+            f"is nothing this could be a diff against. Either the config was "
+            f"never deployed, or --prefix is wrong (it is '{args.prefix}'; the "
+            f"names it looked for are: "
+            f"{', '.join(sorted(k for k in want if k.startswith(ep_prefix)))}).")
+
+    delta = sync.diff(want, live, dmeta, old_inputs, new_inputs)
+
+    # --- report
+    staged = review = ""
+    if delta.has_records:
+        staged = os.path.join(args.stage_dir,
+                              f"xcbot-sync-{_stamp()}.sh")
+    if delta.has_review:
+        review = os.path.join(args.stage_dir,
+                              f"xcbot-sync-{_stamp()}-review.sh")
+    report = sync.format_delta(delta, args.prefix, partition, staged, review)
+    print(report)
+
+    if staged:
+        _write(staged, sync.render_sync_script(
+            delta, args.prefix, partition,
+            sync.format_delta(delta, args.prefix, partition)), 0o750)
+        _write(staged[:-3] + ".json",
+               sync.sidecar(delta, args.prefix, partition, want, live), 0o640)
+    if review:
+        _write(review, sync.render_review_script(delta, args.prefix, partition),
+               0o640)
+
+    _notify(args, sync.summary_line(delta), report)
+    return delta.exit_code()
+
+
+def _sync_apply(args) -> int:
+    ask = Asker(not args.yes)
+    path = args.apply_file
+    side_path = path[:-3] + ".json" if path.endswith(".sh") else path + ".json"
+    if not os.path.exists(side_path):
+        raise SystemExit(
+            f"No {side_path} beside {path}. --apply only runs a script that "
+            f"'sync --check' staged, because the sidecar is what records the "
+            f"box state the diff was computed against.")
+    with open(side_path, encoding="utf-8") as fh:
+        side = json.load(fh)
+    with open(path, encoding="utf-8") as fh:
+        script = fh.read()
+
+    partition = side.get("partition") or "Common"
+    transport = _sync_transport(args, ask, partition)
+    live = transport.read_data_groups(side.get("checked") or [])
+    now = sync.fingerprint(live, side.get("checked") or [])
+    if now != side.get("fingerprint"):
+        raise SystemExit(
+            f"The box changed since this was staged (fingerprint "
+            f"{side.get('fingerprint')} -> {now}), so the diff you would be "
+            f"approving is not the diff that would be applied.\n"
+            f"Re-run 'sync --check' and review the new one.")
+
+    # The diff comes out of the artifact itself, not from recomputing it: what
+    # is being approved is what this file will do.
+    print(f"--- {path}", file=sys.stderr)
+    for line in script.splitlines():
+        if not line.startswith("#"):
+            break                            # header over, commands start here
+        if line.startswith("#!") or line.startswith("# state-fingerprint"):
+            continue
+        print(line[2:] if line.startswith("# ") else line[1:])
+    print()
+    print("The commands it will run:", file=sys.stderr)
+    for line in script.splitlines():
+        if line.startswith("tmsh"):
+            print(f"  {line}")
+    print()
+    if not args.yes and not ask.confirm(
+            f"Apply these record changes via {transport.label}?", False):
+        raise SystemExit("Aborted -- nothing was written.")
+
+    out = transport.run_script(script, os.path.basename(path))
+    print(out)
+    _notify(args, f"applied {os.path.basename(path)}: "
+                  f"{len(side.get('records') or {})} data group(s)", out)
+    return 0
+
+
+def _stamp() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _write(path: str, text: str, mode: int) -> None:
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str]):
@@ -708,6 +927,47 @@ def parse_args(argv: list[str]):
     d.add_argument("--yes", "-y", action="store_true",
                    help="skip the confirmation prompt")
     d.set_defaults(func=cmd_deploy)
+
+    s = sub.add_parser(
+        "sync", help="check whether the XC policy has moved, and apply the "
+                     "record-level part of the difference")
+    s.add_argument("--check", action="store_true",
+                   help="compare XC against the box; print the diff, log it, "
+                        "and stage an apply script. Writes no BIG-IP config")
+    s.add_argument("--apply", dest="apply_file", default="", metavar="PATH",
+                   help="apply a script that --check staged, after showing the "
+                        "diff and asking")
+    s.add_argument("--inputs", default=DEFAULT_INPUTS,
+                   help="the fetched file; supplies the tenant, namespace and "
+                        "infra to re-check, and the previous values that "
+                        "non-endpoint drift is compared against")
+    s.add_argument("--prefix", default="bot-defense",
+                   help="the prefix the deployed objects were built with. Must "
+                        "match, or there is nothing to diff against")
+    s.add_argument("--partition", default="Common", metavar="NAME")
+    s.add_argument("--merge-ops", default="", metavar="OP",
+                   choices=["", "contains", "starts-with", "ends-with", "equals"],
+                   help="the --merge-ops the objects were built with, if any. "
+                        "Wrong value here means wrong data-group names")
+    s.add_argument("--stage-dir", default="/var/tmp", metavar="DIR",
+                   help="where the staged script and its sidecar go "
+                        "(default /var/tmp)")
+    s.add_argument("--log-file", default="/var/log/xcbot-sync.log", metavar="PATH",
+                   help="full diff is appended here; a one-line summary always "
+                        "goes to syslog via logger. Empty string disables the file")
+    s.add_argument("--tenant", default="", help="override the inputs file")
+    s.add_argument("--namespace", default="", help="override the inputs file")
+    s.add_argument("--infra", default="", help="override the inputs file")
+    s.add_argument("--token-file", default="", metavar="PATH",
+                   help=f"read the API token from PATH instead of "
+                        f"./{DEFAULT_TOKEN_FILE}")
+    s.add_argument("--no-verify-tls", action="store_true",
+                   help="skip TLS verification against XC (lab only)")
+    bigip_opts(s)
+    s.add_argument("--yes", "-y", action="store_true",
+                   help="with --apply, skip the confirmation. With --check it "
+                        "only suppresses prompting; --check never writes config")
+    s.set_defaults(func=cmd_sync)
 
     return ap.parse_args(argv)
 

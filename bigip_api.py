@@ -146,6 +146,50 @@ class BigIP:
             found[kind] = sorted(names)
         return found
 
+    def data_group_names(self, partition: str = "Common") -> list[str]:
+        """Bare names of the internal data groups in `partition`.
+
+        Needed to spot a data group the build once created that the XC policy no
+        longer calls for -- something a lookup by expected name cannot see,
+        because the whole point is that nothing expects it any more.
+        """
+        part = (partition or "Common").strip("/")
+        try:
+            data = self._get("/tm/ltm/data-group/internal")
+        except Exception:
+            return []
+        return sorted(i["name"] for i in (data.get("items") or [])
+                      if isinstance(i, dict) and i.get("name")
+                      and (i.get("partition")
+                           or _partition_of(i.get("fullPath", ""))) == part)
+
+    def data_groups(self, names, partition: str = "Common"
+                    ) -> dict[str, dict[str, str] | None]:
+        """{name: {record: value}} per name, or None where it does not exist.
+
+        None rather than {} for an absent data group: an existing one with no
+        records is a different fact, and `sync` reads "absent" as "this bucket
+        was never built", which needs a policy rule rather than a record.
+
+        A 404 is the only failure treated as absence. Anything else is raised --
+        an unreachable box must not read as "every data group is missing".
+        """
+        out: dict[str, dict[str, str] | None] = {}
+        for name in names:
+            bare = name.rsplit("/", 1)[-1]
+            ref = f"~{(partition or 'Common').strip('/')}~{bare}"
+            try:
+                data = self._get(f"/tm/ltm/data-group/internal/{ref}")
+            except HTTPError as e:
+                if e.status == 404:
+                    out[name] = None
+                    continue
+                raise
+            out[name] = {r.get("name", ""): r.get("data", "") or ""
+                         for r in (data.get("records") or [])
+                         if isinstance(r, dict) and r.get("name")}
+        return out
+
     # -- deploy --------------------------------------------------------------
     def _upload(self, text: str, remote_name: str) -> str:
         """Push a file into /var/config/rest/downloads/ and return its path."""

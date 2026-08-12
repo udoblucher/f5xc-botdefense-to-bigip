@@ -208,6 +208,45 @@ Anything else logs `is NOT an Entrypoint`. Then check:
 Once you are satisfied, set `static::botdefense_debug 0` in the iRule and
 reload it. Leaving it at 1 logs a line per request.
 
+## Step 9 — keep it in step with XC
+
+What you just deployed is a snapshot. When somebody adds a protected endpoint in
+XC, this BIG-IP keeps steering the old set and nothing tells you — the new
+endpoint reaches your application uninspected.
+
+`sync` compares XC against the data groups **as they actually are on the box**:
+
+```bash
+python3 xcbot.py sync --check --bigip bigip.example.com --bigip-user admin
+```
+
+Exit `0` means no differences. Exit `10` means it found endpoint or egress
+changes and wrote a script for them, which you apply after reading it:
+
+```bash
+python3 xcbot.py sync --apply /var/tmp/xcbot-sync-20260812-031701.sh \
+                      --bigip bigip.example.com
+```
+
+It shows the diff again and asks before writing anything. Exit `20` means the
+change needs a new LTM policy rule, which is a traffic-path change — it writes a
+`*-review.sh` to read, and the fix is to re-run `fetch` and `build`.
+
+To have it watch for you, put the modules, `botdefense_inputs.json` and the
+token in `/config/xcbot/` on the box (`/config` survives an upgrade; token mode
+`0600`) and add one cron line:
+
+```cron
+MAILTO=netops@example.com
+17 3 * * * cd /config/xcbot && /usr/bin/python3 xcbot.py sync --check --prefix bot-defense
+```
+
+The scheduled run stages and logs; it never applies. Every run leaves a line in
+`/var/log/ltm` (`xcbot[...]: policy=... 2 record change(s) staged`), and the full
+diff goes to `/var/log/xcbot-sync.log`. Details, and the table of what gets
+staged versus what only gets reported, are in
+[Keeping up with XC](README.md#keeping-up-with-xc).
+
 ## Rolling back
 
 Every generated script carries the full rollback list in its footer, in
@@ -239,4 +278,7 @@ objects afterwards is housekeeping.
 | Protected endpoints hang | The loop guard is not matching. See step 8. |
 | Pool down | DNS resolver, then egress 443 to the service FQDN. |
 | Script not in the HTML | The page is not an entrypoint (check `/var/log/ltm`), or the origin returned a compressed response — the HTML profile has nothing to parse in gzip. The tool does not handle compression; *this one was not reproduced in the lab*. |
+| `sync` says no data group under `<prefix>-*` exists | Wrong `--prefix` (or `--partition`, or `--merge-ops`) for what you deployed — it names the objects it looked for. It refuses rather than diff the wrong set. |
+| `sync --apply` says the box changed since this was staged | Somebody edited a data group between the check and the apply, so the diff you would approve is not the diff that would be applied. Re-run `--check` and read the new one. The old script is dead; delete it. |
+| `sync --apply` says there is no `.json` beside the script | `--apply` only runs a script `--check` staged — the sidecar is what records the box state the diff was computed against. Re-run `--check`. |
 | An existing iRule sets a pool | Stop. It silently overrides the policy for the requests it touches — use F5's validated Shape connector iRule instead. See [README](README.md#coexisting-with-existing-irules). |

@@ -69,6 +69,10 @@ what XC actually said.
 
 Pick a subset with `--ui`, `--tmsh`, `--as3`; the default is all of them.
 
+Two optional extras: **`deploy`** pushes an artifact you have already reviewed,
+and **`sync`** tells you when the XC policy has moved since you built from it.
+See [Deploying](#deploying) and [Keeping up with XC](#keeping-up-with-xc).
+
 ### Interactive by default
 
 Omit an answer and you get asked. `--namespace` and `--infra` become pick-lists
@@ -505,6 +509,111 @@ pool.
 
 ---
 
+## Keeping up with XC
+
+Once the config is on the box it is a frozen snapshot. Add a protected endpoint
+in XC and the BIG-IP keeps steering the old set — the new endpoint reaches the
+application without ever being inspected, and nothing says so.
+
+`sync` re-reads the policy from XC, compares it against **the data groups as
+they actually are on the box**, prints the diff, and applies only the part that
+is a record edit — after a human confirms that exact diff.
+
+```bash
+# compare. Writes no BIG-IP config, ever.
+python3 xcbot.py sync --check                              # on the box, via tmsh
+python3 xcbot.py sync --check --bigip bigip.example.com    # remotely, via REST
+
+# apply what --check staged, after showing the diff again and asking
+python3 xcbot.py sync --apply /var/tmp/xcbot-sync-20260812-031701.sh
+```
+
+`--check` needs the XC token and `botdefense_inputs.json` — the inputs file is
+where it reads the tenant, namespace and infra to go and ask about, and the
+previous values that non-endpoint drift is compared against. `--prefix`,
+`--partition` and `--merge-ops` must match what `build` was run with, or the
+names it looks for are not the names on the box.
+
+### What is staged, and what is only reported
+
+`_endpoint_buckets()` groups endpoints by (method, operator, case sensitivity,
+negation), and **each bucket is one data group *and* one rule in the LTM
+policy**. That line is the whole reason there are two classes of change:
+
+| Change in XC | |
+|---|---|
+| Endpoint added/removed in a bucket that **already exists** | **staged** — one `records add`/`records delete` |
+| Egress address added/removed | **staged** |
+| Endpoint needs a **new** bucket | **review** — needs a data group *and* a new policy rule |
+| A bucket disappeared from the policy entirely | **review** |
+| `js.script_src` or `js.match_path` changed | **review** — the HTML rule carries the script URL, so the data group and the rule move together |
+| Bot Defense service host or port changed | **review** — pool member |
+| The `GET_DOCUMENT` set changed | advisory. The entrypoint data group is hand-maintained and `sync` never touches it |
+| New `unsupported_endpoints`, new mobile endpoints | advisory |
+
+The generated policy is applied with `load sys config merge`, which rewrites the
+whole published policy object in one operation. That is not something to stage
+for rubber-stamping, so review items go to a separate `*-review.sh` that carries
+the commands as comments and **is not runnable by `--apply`** — it exists to be
+read. The remedy for those is `fetch` → `build` → read the attach step.
+
+### Exit codes
+
+| | |
+|---|---|
+| `0` | no differences, or `--apply` succeeded |
+| `10` | record changes staged, waiting for someone to apply them |
+| `20` | changes needing review; nothing staged |
+| `1` | error, or `--apply` declined/aborted |
+
+### From cron on the BIG-IP
+
+The scheduled run **stages, it does not apply** — same contract as `deploy`: the
+artifact that gets applied is the artifact that was reviewed, never regenerated.
+Copy the six `.py` files, `botdefense_inputs.json` and the token into
+`/config/xcbot/` (`/config` survives an upgrade; token mode `0600`), then:
+
+```cron
+MAILTO=netops@example.com
+17 3 * * * cd /config/xcbot && /usr/bin/python3 xcbot.py sync --check --prefix bot-defense
+```
+
+Read-only XC access is enough — `sync` never writes to XC. Every run puts one
+line in `/var/log/ltm` via `logger -p local0.notice -t xcbot`, beside what the
+generated iRule already logs, so an existing forwarder picks it up with no new
+configuration:
+
+```
+xcbot[12345]: policy=endpoint-web-5-2 v15.0->v16.0: 2 record change(s) staged
+```
+
+The full diff is appended to `--log-file` (default `/var/log/xcbot-sync.log`,
+self-truncating at 1 MB). Cron mails stdout wherever `MAILTO` points, which is
+the diff itself, at no extra cost.
+
+### Why it is safe to leave running
+
+- **`--check` never writes BIG-IP config.** It reads XC, reads the box, and
+  writes a script into `--stage-dir` (default `/var/tmp`).
+- **Staleness guard.** `--check` records a sha256 over the live records of every
+  affected data group into a `.json` sidecar. `--apply` recomputes it and refuses
+  if the box moved underneath, naming both fingerprints. `--apply` will not run a
+  script that has no sidecar.
+- **Targeted edits, never `replace-all-with`.** Only the exact keys in the diff
+  are added or deleted, so a record someone added deliberately is left alone and
+  reported as drift next run rather than silently reverted by a job.
+- **A wrong `--prefix` fails loudly.** `sync` refuses to run unless at least one
+  `<prefix>-endpoints-*` data group exists, and names the ones it looked for —
+  otherwise `--prefix bot` would quietly diff against somebody's hand-built
+  `bot-endpoints`.
+- **The entrypoint data group is never touched.** It is yours to map.
+
+Verified end to end on 17.5.1, both transports: drift in either direction,
+the fingerprint refusal, the review path, a wrong prefix, and a cron-style run
+with no tty.
+
+---
+
 ## Files
 
 | File | Contents |
@@ -512,8 +621,10 @@ pool.
 | `xcbot.py` | CLI, prompting, orchestration |
 | `xc_api.py` | XC client and `normalize()` — the only place the XC schema is understood |
 | `render.py` | `build_plan()` and the three renderers |
+| `sync.py` | the drift diff: desired state, classification, staged artifact |
 | `bigip_api.py` | BIG-IP discovery and deploy |
 | `rest.py` | stdlib HTTP |
+| `test_sync.py` | offline tests for the diff engine — no BIG-IP, no network |
 | `xc_api_token.txt.example` | the placeholder token file, copied to `xc_api_token.txt` on first run |
 
 `build_plan()` makes every decision; the renderers only describe the plan. That
