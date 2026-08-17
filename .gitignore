@@ -16,10 +16,17 @@ botdefense_inputs.json
 # Generated artifacts -- same reasoning, plus they are outputs, not sources.
 out/
 
-# F5-authored AVK connector iRules, kept locally for reference. Not imported by
-# this tool, not ours to republish, and they carry a policy-specific telemetry
-# header prefix.
-bna_vs_test_*.txt
+# Vendor connector iRules, kept locally for reference. Not imported by this
+# tool, not ours to republish, and they carry a policy-specific telemetry header
+# prefix. Deliberately broad rather than by filename: every .txt at the repo
+# root is local reference material. The committed placeholders end in .example,
+# so they are unaffected.
+/*.txt
+!/requirements.txt
+
+# Blog draft. Writing about the tool, not part of it -- and it quotes the vendor
+# connector iRules above, which are not ours to republish.
+blog/
 
 # Local tooling state: machine addresses and shell history.
 .claude/settings.local.json
