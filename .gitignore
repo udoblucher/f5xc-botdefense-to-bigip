@@ -28,6 +28,9 @@ out/
 # connector iRules above, which are not ours to republish.
 blog/
 
+# Local presentation material. Not part of the tool.
+site/
+
 # Local tooling state: machine addresses and shell history.
 .claude/settings.local.json
 
