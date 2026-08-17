@@ -1,0 +1,247 @@
+# BIG-IP configuration for F5 XC Bot Defense -- template for a manual build.
+# Same objects xcbot.py creates, with the default object names.
+#
+# Single-line commands are written for the tmsh shell: run `tmsh`, then paste.
+# From bash instead, wrap each one:  tmsh -c '<command>'
+# Three objects cannot be created from a single line -- the html rule, the
+# iRule and the policy -- so those are merged from a config file, in bash.
+#
+# Replace before running:
+#   bot.example.net    the Bot Defense service host for your XC tenant
+#   203.0.113.10/32    its egress addresses, one record each
+#   /common.js         the path XC serves the JavaScript on
+#   /login /search     your own protected paths
+#   secureapp          your virtual server
+#   /Common/app-pool   the pool secureapp already uses
+#
+# Order matters. Steps 1-8 only create objects; live traffic is untouched
+# until step 9 attaches them to the virtual server.
+#
+# Prerequisites on the virtual server: an HTTP profile must already be there,
+# and no HTML or OneConnect profile may be, because it takes only one of each.
+#   list ltm virtual secureapp profiles
+
+
+# --- 1. health monitor -----------------------------------------------------
+# recv none: the monitor passes on any response, so a 401 from the service
+# still marks the pool member up.
+create ltm monitor https bot-defense-hc defaults-from https interval 5 timeout 16 recv none send "GET /sedcloudapi/health HTTP/1.1\r\nhost: bot.example.net\r\nconnection: close\r\n"
+
+
+# --- 2. pool ---------------------------------------------------------------
+# An FQDN member, not an address: the service resolves to addresses that
+# change, and the BIG-IP re-resolves on its own.
+create ltm pool bot-defense-pool monitor bot-defense-hc members add { bot.example.net:443 { fqdn { autopopulate enabled name bot.example.net } } }
+
+
+# --- 3. data groups --------------------------------------------------------
+# The addresses the service sends inspected traffic back from. Rule 2 of the
+# policy requires a match here, so an attacker cannot fake the return leg
+# with a header alone.
+create ltm data-group internal bot-defense-egress type ip records add { 203.0.113.10/32 { } 203.0.113.11/32 { } }
+
+# The path the JavaScript itself is served on. Requests for it go to the
+# service, not to the application.
+create ltm data-group internal bot-defense-js type string records add { /common.js { } }
+
+# Pages that get the script tag, with the methods that count. Read by the
+# iRule, not by the policy. Add a record per page, then drop the "/"
+# catch-all.
+create ltm data-group internal bot-defense-entrypoint type string records add { / { data GET } }
+
+# The protected endpoints, one data group per method-and-match-type pair.
+# The name carries the pairing: -get-endswith is case-sensitive, the -ci
+# suffix means case-insensitive. Add a group per combination you need and a
+# matching rule in the policy below.
+create ltm data-group internal bot-defense-endpoints-get-endswith type string records add { /search { } }
+create ltm data-group internal bot-defense-endpoints-post-equals-ci type string records add { /login { } }
+
+
+# --- 4. html rule ----------------------------------------------------------
+# Appends the script tag to <head>. Merged from a file because tmsh -c strips
+# the escaped quotes out of the tag and leaves src unquoted.
+# In bash:
+#
+#   cat > /var/tmp/htmlrule.conf <<'EOF'
+#   ltm html-rule tag-append-html bot-defense-js-rule {
+#       action {
+#           text "<script src=\"/common.js\?single\"></script>"
+#       }
+#       match {
+#           tag-name head
+#       }
+#   }
+#   EOF
+#   tmsh load sys config merge file /var/tmp/htmlrule.conf
+
+
+# --- 5. html profile -------------------------------------------------------
+# Carries the rule above. The iRule keeps this profile switched off except on
+# responses to an entrypoint request, so the parser does not run on every
+# response.
+create ltm profile html bot-defense-js-profile defaults-from html content-selection add { text/html text/xhtml } rules add { bot-defense-js-rule }
+
+
+# --- 6. OneConnect profile -------------------------------------------------
+# A /32 source mask, so connections are only reused for the same client.
+create ltm profile one-connect bot-defense-oneconnect defaults-from oneconnect source-mask 255.255.255.255
+
+
+# --- 7. iRule --------------------------------------------------------------
+# The body is the sibling file, templates/bot-defense-irule.tcl. Paste it into
+# Local Traffic >> iRules >> Create, or merge it in bash:
+#
+#   { echo 'ltm rule bot-defense-irule {'; cat bot-defense-irule.tcl; echo '}'; } \
+#       > /var/tmp/irule.conf
+#   tmsh load sys config merge file /var/tmp/irule.conf
+
+
+# --- 8. LTM policy ---------------------------------------------------------
+# First-match, so rule order is the logic: the script path is claimed first,
+# already-inspected traffic is let through second, and the protected
+# endpoints are steered last.
+#
+# fallback-pool is the pool the virtual server already uses -- where a
+# matched request goes if the Bot Defense pool is down. Replace
+# /Common/app-pool with yours, or delete those two lines to let a matched
+# request fail when the pool is down.
+#
+# Merged rather than created inline because the rules nest. In bash:
+#
+#   cat > /var/tmp/policy.conf <<'EOF'
+#   ltm policy bot-defense-policy {
+#       controls { forwarding }
+#       requires { http tcp }
+#       strategy first-match
+#       rules {
+#           bot-defense-js {
+#               ordinal 0
+#               conditions {
+#                   0 {
+#                       http-uri
+#                       path
+#                       contains
+#                       datagroup bot-defense-js
+#                   }
+#               }
+#               actions {
+#                   0 {
+#                       forward
+#                       select
+#                       pool bot-defense-pool
+#                   }
+#               }
+#           }
+#           bot-defense-return {
+#               ordinal 1
+#               conditions {
+#                   0 {
+#                       http-header
+#                       name shape-header
+#                       exists
+#                   }
+#                   1 {
+#                       tcp
+#                       address
+#                       matches
+#                       datagroup bot-defense-egress
+#                   }
+#               }
+#           }
+#           bot-defense-endpoints-get-endswith {
+#               ordinal 2
+#               conditions {
+#                   0 {
+#                       http-method
+#                       values { GET }
+#                   }
+#                   1 {
+#                       http-uri
+#                       path
+#                       ends-with
+#                       case-sensitive
+#                       datagroup bot-defense-endpoints-get-endswith
+#                   }
+#               }
+#               actions {
+#                   0 {
+#                       forward
+#                       select
+#                       fallback-pool /Common/app-pool
+#                       pool bot-defense-pool
+#                   }
+#               }
+#           }
+#           bot-defense-endpoints-post-equals-ci {
+#               ordinal 3
+#               conditions {
+#                   0 {
+#                       http-method
+#                       values { POST }
+#                   }
+#                   1 {
+#                       http-uri
+#                       path
+#                       equals
+#                       datagroup bot-defense-endpoints-post-equals-ci
+#                   }
+#               }
+#               actions {
+#                   0 {
+#                       forward
+#                       select
+#                       fallback-pool /Common/app-pool
+#                       pool bot-defense-pool
+#                   }
+#               }
+#           }
+#       }
+#   }
+#   EOF
+#   tmsh load sys config merge file /var/tmp/policy.conf
+#
+# A policy merged this way is created published, so no separate publish step
+# is needed.
+
+
+# --- 9. attach to the virtual server ---------------------------------------
+# This is the step that affects live traffic, and the only one to undo in a
+# hurry.
+#
+# Check first what is already there. Any iRule that runs pool, node, virtual
+# or LB::reselect overrides this policy for the requests it touches:
+list ltm virtual secureapp rules
+#
+# `rules` is an ordered list and REPLACES what is there, so name every iRule
+# the virtual server should end up with, not just this one:
+modify ltm virtual secureapp profiles add { bot-defense-js-profile bot-defense-oneconnect } policies add { bot-defense-policy } rules { bot-defense-irule }
+
+save sys config
+
+
+# --- 10. check -------------------------------------------------------------
+show ltm pool bot-defense-pool
+show ltm policy bot-defense-policy
+# and, with debug left at 1 in the iRule:  tail -f /var/log/ltm
+
+
+# --- backing it out --------------------------------------------------------
+# In this order. The iRule calls HTML::disable, so it has to come off the
+# virtual server before the HTML profile it depends on, or the detach is
+# refused with 01071912:3.
+#
+#   modify ltm virtual secureapp rules { }        # then re-add your own
+#   modify ltm virtual secureapp policies delete { bot-defense-policy }
+#   modify ltm virtual secureapp profiles delete { bot-defense-js-profile bot-defense-oneconnect }
+#   delete ltm policy bot-defense-policy
+#   delete ltm rule bot-defense-irule
+#   delete ltm profile html bot-defense-js-profile
+#   delete ltm profile one-connect bot-defense-oneconnect
+#   delete ltm html-rule tag-append-html bot-defense-js-rule
+#   delete ltm data-group internal bot-defense-egress
+#   delete ltm data-group internal bot-defense-js
+#   delete ltm data-group internal bot-defense-entrypoint
+#   delete ltm data-group internal bot-defense-endpoints-get-endswith
+#   delete ltm data-group internal bot-defense-endpoints-post-equals-ci
+#   delete ltm pool bot-defense-pool
+#   delete ltm monitor https bot-defense-hc

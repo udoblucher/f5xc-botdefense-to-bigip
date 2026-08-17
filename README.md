@@ -460,11 +460,26 @@ regenerates. It prompts before doing anything.
 
 ### Without running the tool at all
 
-`templates/bot-defense-irule.tcl` is the same iRule the generator writes, with
-the default object names and no fingerprint line. Download it, paste it into
-**Local Traffic ›› iRules ›› Create**, and build the rest by hand. Its header
-lists what has to exist alongside it: an HTTP profile, an HTML profile with the
-script-tag rule, the LTM policy, and the entrypoint data group it reads.
+Two templates cover the manual build, both carrying the default object names and
+no fingerprint line.
+
+`templates/bot-defense-irule.tcl` is the same iRule the generator writes.
+Download it, paste it into **Local Traffic ›› iRules ›› Create**, and build the
+rest by hand. Its header lists what has to exist alongside it: an HTTP profile,
+an HTML profile with the script-tag rule, the LTM policy, and the entrypoint
+data group it reads.
+
+`templates/bot-defense-config.tmsh` is everything else — the tmsh command for
+every object, in dependency order, then the `modify ltm virtual` that attaches
+them, and the backout sequence. The three objects that cannot be created from a
+single line (the html rule, the iRule and the policy) are given as config
+stanzas to merge with `load sys config merge file`. Its header lists the values
+to replace: the service host, the egress addresses, the JavaScript path, your
+protected paths, the virtual server and its existing pool.
+
+Neither template carries a `description xcbot:` stamp, so objects built from
+them read as hand-made — the tool will offer to create its own alongside rather
+than assume it owns yours.
 
 **The tmsh script is safe to re-run.** Each step reads the object it is about to
 create and takes one of three paths: absent, so create it; already there with the
@@ -658,6 +673,7 @@ with no tty.
 | `test_sync.py` | offline tests for the diff engine — no BIG-IP, no network |
 | `xc_api_token.txt.example` | the placeholder token file, copied to `xc_api_token.txt` on first run |
 | `templates/bot-defense-irule.tcl` | the generated iRule, as a standalone template for a manual build |
+| `templates/bot-defense-config.tmsh` | the tmsh commands for every other object, and the attach, for a manual build |
 
 `build_plan()` makes every decision; the renderers only describe the plan. That
 is what keeps the GUI steps, the tmsh script and the AS3 declaration from

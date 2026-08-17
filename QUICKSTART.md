@@ -134,9 +134,10 @@ You get four files in `out/`:
 
 `--ui`, `--tmsh`, `--as3` pick a subset.
 
-If you only want the iRule and intend to configure everything else by hand,
-`templates/bot-defense-irule.tcl` in this repo is the same rule with the default
-object names — no need to run the tool at all.
+If you intend to configure this by hand, the `templates/` folder has both halves
+with the default object names, so there is no need to run the tool at all:
+`bot-defense-irule.tcl` is the iRule body, and `bot-defense-config.tmsh` is the
+tmsh command for every other object plus the attach and the backout.
 
 ## Step 6 — read the output before you apply it
 
