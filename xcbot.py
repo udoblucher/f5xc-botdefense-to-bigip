@@ -46,6 +46,7 @@ import datetime
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -54,8 +55,8 @@ import sync
 import xc_api
 from bigip_api import BigIP
 from rest import HTTPError
-from render import (build_plan, irule_selects_pool, render_as3, render_tmsh,
-                    render_ui)
+from render import (build_plan, fingerprints, irule_selects_pool, render_as3,
+                    render_tmsh, render_ui)
 
 DEFAULT_INPUTS = "botdefense_inputs.json"
 
@@ -545,14 +546,29 @@ def cmd_build(args) -> int:
 
 
 def _collision_check(bip: BigIP, plan: dict) -> None:
-    """Warn when an object we are about to create already exists.
+    """Say what the generated script will do with the names already taken.
+
+    Not a gate. The script checks every object itself and either reuses it or
+    stops without changing it, so a taken name is no longer a reason not to
+    build. This asks the same question early, where a human is present and
+    `--prefix` is still cheap to change.
+
+    What is read is the provenance marker -- `description "xcbot:<hash>"`, or
+    for `ltm rule` the same hash as a comment in the body, since that type has
+    no description property. The marker sorts a taken name into one of three
+    outcomes. What is deliberately *not* read is the object's content: that
+    comparison lives in the artifact, in bash, and running a second copy of it
+    here in Python is how the two would come to disagree about what "matches"
+    means.
 
     Scoped to the target partition. The same name in another partition is
     expected -- that is how two applications get their own Bot Defense config --
-    and warning about it would train the operator to ignore the warning.
+    and reporting it would train the operator to ignore the report.
     """
     n = plan["names"]
     part = (plan["partition"] or "Common").strip("/")
+    fps = fingerprints(plan)
+    dg_names = {dg["name"] for dg in plan["datagroups"]}
     wanted = {
         "ltm/pool": [n["pool"]],
         "ltm/monitor/https": [n["monitor"]],
@@ -561,23 +577,59 @@ def _collision_check(bip: BigIP, plan: dict) -> None:
         "ltm/profile/html": [n["html_profile"]],
         "ltm/profile/one-connect": ([n["oneconnect"]]
                                     if plan["oneconnect"] else []),
-        "ltm/html-rule": [n["html_rule"]],
-        "ltm/data-group/internal": [dg["name"] for dg in plan["datagroups"]],
+        # The type, not the bare 'ltm/html-rule' collection: that one holds
+        # pointers with no name of their own and would never match.
+        "ltm/html-rule/tag-append-html": [n["html_rule"]],
+        "ltm/data-group/internal": sorted(dg_names),
     }
     try:
-        existing = bip.existing_names(tuple(wanted))
+        existing = bip.existing_objects(tuple(wanted))
     except Exception as e:
-        print(f"  (could not check for name collisions: {e})", file=sys.stderr)
+        print(f"  (could not check what is already on the box: {e})",
+              file=sys.stderr)
         return
-    clashes = [f"{kind} /{part}/{name}" for kind, names in wanted.items()
-               for name in names if f"/{part}/{name}" in existing.get(kind, [])]
-    if clashes:
-        print("\n  These objects already exist on the BIG-IP and the generated "
-              "create commands would fail:", file=sys.stderr)
-        for c in clashes:
-            print(f"    - {c}", file=sys.stderr)
-        print("  Use --prefix to pick different names, or delete the existing "
-              "objects first.\n", file=sys.stderr)
+
+    mine, older, theirs = [], [], []
+    for kind, names in wanted.items():
+        for name in names:
+            obj = (existing.get(kind) or {}).get(f"/{part}/{name}")
+            if obj is None:
+                continue
+            if kind == "ltm/rule":
+                m = re.search(r"# xcbot-fingerprint: ([0-9a-f]+)",
+                              obj["body"] or "")
+                live = m.group(1) if m else ""
+            else:
+                desc = obj["description"] or ""
+                live = desc[6:] if desc.startswith("xcbot:") else ""
+            label = f"{kind} /{part}/{name}"
+            (mine if live and live == fps.get(name)
+             else older if live else theirs).append(label)
+
+    if not (mine or older or theirs):
+        return
+    out = ["", "  Some of these names are already taken on the BIG-IP. None of "
+           "it blocks the build --",
+           "  the generated script checks each object again on the box:"]
+    for heading, group in (
+            (["    Already this build's own -- will be reused:"], mine),
+            (["    Made by an earlier build of this tool -- reused if the "
+              "content still matches,",
+              "    otherwise the script stops at that step and changes "
+              "nothing:"], older),
+            (["    Not created by this tool -- the script compares the content "
+              "and either",
+              "    reuses it, saying whose it is, or stops at that step:"],
+             theirs)):
+        if group:
+            out += [""] + heading + [f"      - {c}" for c in group]
+    if dg_names & {c.rsplit("/", 1)[-1] for c in mine + older + theirs}:
+        out += ["", "    Data-group records are never rewritten by deploy, "
+                "whatever the verdict above.",
+                "    Reconcile them with: python3 xcbot.py sync --check"]
+    out += ["", "  To build alongside what is there instead of onto it, pick a "
+            "different --prefix.", ""]
+    print("\n".join(out), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +649,17 @@ def cmd_deploy(args) -> int:
               file=sys.stderr)
         if not args.yes and not ask.confirm("Proceed?", False):
             raise SystemExit("Aborted -- nothing was sent.")
-        print(bip.deploy_tmsh(script, os.path.basename(args.tmsh_file)))
+        out, rc = bip.deploy_tmsh(script, os.path.basename(args.tmsh_file))
+        print(out)
+        if rc != 0:
+            # The script stops itself when an object exists with different
+            # content, and it says why on stderr, which is already in `out`.
+            # Nothing to add here except the exit code, so that a caller in a
+            # pipeline is not told a half-finished build succeeded.
+            print(f"\n{args.tmsh_file} exited {rc} -- see the abort above. "
+                  f"Nothing was attached to the virtual server unless the "
+                  f"output says otherwise.", file=sys.stderr)
+            return rc
 
     if args.as3_file:
         with open(args.as3_file, encoding="utf-8") as fh:

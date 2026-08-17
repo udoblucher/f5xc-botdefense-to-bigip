@@ -134,6 +134,10 @@ You get four files in `out/`:
 
 `--ui`, `--tmsh`, `--as3` pick a subset.
 
+If you only want the iRule and intend to configure everything else by hand,
+`templates/bot-defense-irule.tcl` in this repo is the same rule with the default
+object names — no need to run the tool at all.
+
 ## Step 6 — read the output before you apply it
 
 Non-negotiable, and it takes two minutes:
@@ -172,6 +176,26 @@ python3 xcbot.py deploy --bigip bigip.example.com --tmsh out/secureapp_botdefens
 
 `deploy` uploads the file you just reviewed and runs it — it never regenerates.
 It prompts first.
+
+**Re-running is safe.** Every step looks for its object before it writes
+anything: missing means create, present with the same content means reuse and
+say so, present with different content means stop, print live vs wanted, and
+change nothing. So a run that stopped half way — a refused attach, a lost
+connection — is finished by running the same script again. It ends with a
+`Created N object(s), reused M` line.
+
+Two things it will never do: modify or delete an object that already exists, and
+write data-group records. If the records on the box have drifted from what XC
+says, the run reports the difference and moves on; reconciling them is
+`xcbot.py sync --check`, which has its own approval step.
+
+That leaves one thing to know about the objects it reuses. Each one it creates
+carries `description "xcbot:<hash>"` (the iRule, which has no description
+property, carries the same hash as a comment in its body), and that marker is
+only ever used to decide the wording — whether the script says "reusing this
+build's own" or "reusing someone else's, and here is what else uses it".
+Content is what decides reuse, so clearing a description does not make the
+script overwrite anything.
 
 For AS3, read [AS3 caveats](README.md#as3-caveats) first. Two matter most:
 with `--partition`, **AS3 takes ownership of that whole partition** and deletes
@@ -272,7 +296,11 @@ objects afterwards is housekeeping.
 | `build` warns that the deployment mode is not `REVERSE_PROXY` | It still writes the artifacts, but do not use them: the whole steering design assumes reverse proxy. Fix the infra in XC. |
 | `01020036:3 ... was not found` running the script | A partition mismatch: the VS is not in `--partition`. Name it as `/partition/name`. |
 | `01071912:3 SSL::disable ... requires an associated SERVERSSL or CLIENTSSL or PERSIST profile` | The VS has none. Nothing was applied — the attach is one transaction — so the VS is untouched and you can fix it and re-run just that step. See the requirements table. |
-| `01020066:3 ... policy already exists` | The attach ran before. Nothing was applied. Detach first if you are re-running it. |
+| `exists, but does not match this build` | An object of that name is there with different content. Nothing was changed and nothing after that step ran. The report shows live vs wanted and the one `tmsh modify` that would converge it; run that, or `build` again with a different `--prefix`. |
+| `'load sys config merge' would have overwritten it silently` | Same thing for the html-rule, the iRule or the policy — the three objects that go in through a merge, which would otherwise replace them without a word. This build's version is kept at `/var/tmp/xcbot-<vs>-<name>.conf` and the live one at `.conf.live`, so you can diff the two before deciding. |
+| `NOTE: not created by xcbot (no xcbot marker)` | The object matches what this build wants but was made by somebody else, so it is reused as-is. The note names what else on the box uses it — editing it later moves those too. |
+| `has no HTTP profile` at preflight | An HTML profile cannot be attached without one, so the script stops before creating anything. Worth checking why: a VS with no HTTP profile is not parsing HTTP, so neither the path conditions nor the injection could work on it. |
+| `already carries the html profile <name>` at preflight | A VS takes only one HTML profile. A different `--prefix` will not help — detach that one, or target a different VS. |
 | Protected endpoints return 404 | Bot Defense does not recognise the `Host` your users send. Fix it in XC; the BIG-IP side is working. Unprotected paths still reach the application, which is what makes this one easy to misread. |
 | `01071912:3 HTML::disable ... requires an associated HTML profile` | You are detaching in the wrong order, or the VS never got the HTML profile. iRule off first. |
 | Protected endpoints hang | The loop guard is not matching. See step 8. |

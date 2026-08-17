@@ -123,13 +123,27 @@ class BigIP:
         Qualified, not bare: an object of the same name in another partition is
         not a collision, since a partition gets its own full set of objects.
         """
+        return {kind: sorted(objs)
+                for kind, objs in self.existing_objects(kinds).items()}
+
+    def existing_objects(self, kinds: tuple[str, ...]) -> dict[str, dict]:
+        """The same objects, each with the two fields the marker check reads.
+
+        `description` is where a generated object carries its `xcbot:<hash>`
+        marker. `apiAnonymous` is an iRule's body, which is where that one type
+        keeps its marker instead -- `ltm rule` has no description property.
+
+        Returned per kind as {fullPath: {"description": ..., "body": ...}}, both
+        possibly empty: an object with neither is simply one this tool did not
+        create.
+        """
         found = {}
         for kind in kinds:
             try:
                 data = self._get(f"/tm/{kind}")
             except Exception:
                 continue
-            names = []
+            objs = {}
             for i in (data.get("items") or []):
                 if not isinstance(i, dict):
                     continue
@@ -142,8 +156,9 @@ class BigIP:
                     if not i.get("name"):
                         continue
                     path = f"/{i.get('partition', 'Common')}/{i['name']}"
-                names.append(path)
-            found[kind] = sorted(names)
+                objs[path] = {"description": i.get("description") or "",
+                              "body": i.get("apiAnonymous") or ""}
+            found[kind] = objs
         return found
 
     def data_group_names(self, partition: str = "Common") -> list[str]:
@@ -206,14 +221,32 @@ class BigIP:
                            verify=self.verify, timeout=300)
         return (out or {}).get("commandResult", "") if isinstance(out, dict) else ""
 
-    def deploy_tmsh(self, script_text: str, remote_name: str) -> str:
-        """Upload the generated bash/tmsh script and run it on the box.
+    def deploy_tmsh(self, script_text: str,
+                    remote_name: str) -> tuple[str, int]:
+        """Upload the generated bash/tmsh script, run it, return (output, rc).
 
         Uploaded rather than inlined: _bash single-quotes the command it runs,
         and the script is full of single quotes of its own.
+
+        /mgmt/tm/util/bash answers with the command's output and nothing else --
+        no exit status anywhere in the response -- so the status is asked for in
+        band and stripped back off here. Without it a script that stopped at
+        step 2 because an object did not match would be indistinguishable from
+        one that finished, and `deploy` would exit 0 on a build that never
+        reached the virtual server.
+
+        A missing marker means the run was cut off before the echo (the REST
+        call timed out, the box rebooted). That is not success, so it reports
+        as rc 1.
         """
         path = self._upload(script_text, remote_name)
-        return self._bash(f"bash {path} 2>&1")
+        out = self._bash(f'bash {path} 2>&1; echo "XCBOT_RC=$?"')
+        lines = out.splitlines()
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith("XCBOT_RC="):
+                rc = lines.pop(i).split("=", 1)[1].strip()
+                return "\n".join(lines), int(rc) if rc.isdigit() else 1
+        return out, 1
 
     def deploy_as3(self, declaration: dict) -> str:
         """POST the AS3 declaration to the appsvcs endpoint."""

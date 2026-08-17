@@ -378,7 +378,7 @@ bypassed**:
 Three ways out, best first:
 
 1. **Steer in an iRule instead of the policy** — F5's validated Shape connector.
-   This is exactly why F5's own AVK connector selects its pool in an iRule at
+   This is exactly why F5's own connector iRule selects its pool in an iRule at
    `HTTP_REQUEST priority 999` rather than using an LTM policy: two iRules can be
    ordered against each other, an iRule and a policy cannot. Nothing competes in
    the first place. This is the recommendation whenever a conditional pool
@@ -457,6 +457,37 @@ python3 xcbot.py deploy --bigip bigip.example.com --as3  out/secureapp_botdefens
 
 `deploy` uploads and runs the artifact you already reviewed — it never
 regenerates. It prompts before doing anything.
+
+### Without running the tool at all
+
+`templates/bot-defense-irule.tcl` is the same iRule the generator writes, with
+the default object names and no fingerprint line. Download it, paste it into
+**Local Traffic ›› iRules ›› Create**, and build the rest by hand. Its header
+lists what has to exist alongside it: an HTTP profile, an HTML profile with the
+script-tag rule, the LTM policy, and the entrypoint data group it reads.
+
+**The tmsh script is safe to re-run.** Each step reads the object it is about to
+create and takes one of three paths: absent, so create it; already there with the
+content this build wants, so reuse it and move on; already there with *different*
+content, so print the live value beside the wanted one, print the `tmsh modify`
+that would converge them, and exit non-zero without changing anything. The run
+ends with `Created N object(s), reused M.` A partial box — some objects there,
+some not — is the ordinary case, not an error. This matters most for the three
+multi-line objects (html-rule, iRule, policy), which go in through
+`tmsh load sys config merge`: a merge does not refuse an existing object, it
+overwrites it silently, so on a mismatch the script skips the merge and leaves
+the staged `.conf` and a copy of the live one in `/var/tmp/` for you to compare.
+
+Reuse is decided by content, never by provenance. Created objects carry a
+`description "xcbot:<hash>"` marker (the iRule, which has no description
+property, carries a `# xcbot-fingerprint:` comment instead), but that marker only
+chooses the wording: an object whose content matches and whose marker is missing
+is still reused, with a note saying it was not created by this tool and what else
+on the box references it. Clearing a description therefore cannot cause an
+overwrite. Two things the script never does: modify or delete an existing object,
+and write data-group records. Records are reported as a `+`/`-` delta and left
+alone — `xcbot.py sync --check` is what reconciles them, with its own approval
+step. `<prefix>-entrypoint` is not even diffed; it is hand-maintained by design.
 
 In the tmsh script, **only the second-to-last step touches the virtual server** —
 everything before it just creates objects. That step is numbered for you in the
@@ -626,6 +657,7 @@ with no tty.
 | `rest.py` | stdlib HTTP |
 | `test_sync.py` | offline tests for the diff engine — no BIG-IP, no network |
 | `xc_api_token.txt.example` | the placeholder token file, copied to `xc_api_token.txt` on first run |
+| `templates/bot-defense-irule.tcl` | the generated iRule, as a standalone template for a manual build |
 
 `build_plan()` makes every decision; the renderers only describe the plan. That
 is what keeps the GUI steps, the tmsh script and the AS3 declaration from
@@ -703,8 +735,8 @@ Fetching a policy without one would give you endpoints with nowhere to send them
   application bug rather than a configuration one.
 - **Rule 1 assumes Bot Defense reaches the VS directly**, so the client address
   the BIG-IP sees really is an egress IP. A SNAT or proxy in between breaks the
-  match and the loop returns. F5's own AVK connector makes the same assumption
-  with its `DG-IPs` group. It is the first thing to check if protected endpoints
+  match and the loop returns. F5's own connector iRule makes the same assumption
+  with its egress-address data group. It is the first thing to check if endpoints
   start hanging.
 - **The version the infra runs may not be the policy's latest.** The config is
   built from the policy's current content; a mismatch is warned about, naming

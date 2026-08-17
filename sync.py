@@ -214,7 +214,13 @@ class RestTransport:
                 if n.startswith(prefix)]
 
     def run_script(self, text: str, remote_name: str = "xcbot-sync.sh") -> str:
-        return self.bigip.deploy_tmsh(text, remote_name)
+        # Raised rather than returned, to match LocalTransport above: a sync
+        # script that stopped partway through has written some records and not
+        # others, and the caller has to hear about that as a failure.
+        out, rc = self.bigip.deploy_tmsh(text, remote_name)
+        if rc != 0:
+            raise RuntimeError(f"the sync script failed (exit {rc}):\n{out}")
+        return out
 
 
 # ---------------------------------------------------------------------------
