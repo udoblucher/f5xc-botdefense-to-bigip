@@ -16,11 +16,11 @@ XC Bot Defense in REVERSE_PROXY mode is a service the BIG-IP steers traffic
 into; the BIG-IP does not evaluate bot policy itself. Two independent jobs:
 
   Steering (LTM policy, first-match -- the order IS the logic)
-      rule 0  path contains <js data-group>                  -> bot pool
-      rule 1  shape-header exists AND source in <egress dg>  -> no action
-      rule 2+ method + path <op> <dg>                        -> bot pool,
-                                                               fallback app pool
-      no match                                               -> VS default pool
+      rule 0  path contains <js data-group>                    -> bot pool
+      rule 1  <guard hdr> exists AND source in <egress dg>     -> no action
+      rule 2+ method + path <op> <dg>                          -> bot pool,
+                                                                 fallback app pool
+      no match                                                 -> VS default pool
 
     Rule 0 first and unconditional: the telemetry script is always served by the
     Bot Defense service. That path is terminated by the service rather than
@@ -32,11 +32,15 @@ into; the BIG-IP does not evaluate bot policy itself. Two independent jobs:
     so the positive case is matched here and stopped. Carrying no action,
     first-match ends evaluation and the request proceeds to the VS's own pool.
 
-    Both halves of rule 1 matter. The shape-header alone is a value any client
+    Both halves of rule 1 matter. The guard header alone is a value any client
     can set, so a header-only guard lets a crafted request skip Bot Defense
     entirely; pairing it with the service's egress addresses closes that. When
     the infra advertises no egress addresses we fall back to testing the header
     on each endpoint rule instead, and say so.
+
+    The header's name is the service's to choose, not ours, so it is a
+    parameter (`shape_header`, `--shape-header`) with `shape-header` as the
+    default rather than a constant. Nothing downstream hardcodes it.
 
   Injection (HTML profile + iRule)
       The telemetry <script> is injected into the <head> of responses, but only
@@ -435,12 +439,30 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
     `pool_selecting_irules` is [(name, [commands])] for iRules already on the
     VS that choose a destination themselves. Those beat this policy, so their
     presence is a reason not to use it.
+
+    `shape_header` is the header Bot Defense sets on traffic it hands back, and
+    it is the whole of rule 1's first condition. Configurable because the name
+    is the service's, not ours: a tenant whose deployment sends something else
+    needs the guard to match that instead. Get it wrong and nothing errors --
+    rule 1 simply never matches, and every protected endpoint loops.
     """
     partition = (partition or DEFAULT_PARTITION).strip().strip("/")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", partition):
         raise ValueError(
             f"partition {partition!r} is not a valid BIG-IP partition name: "
             f"letters, digits, '.', '-' and '_' only, no '/'.")
+
+    # RFC 9110 field-name token. Worth checking here rather than trusting the
+    # caller: this string is written unquoted into the policy's `name <hdr>`
+    # line, so a space in it silently becomes a second tmsh keyword and an
+    # empty one drops the condition's name entirely. Either way the failure
+    # lands at `load sys config merge` time, on a box, in a change window.
+    shape_header = (shape_header or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+", shape_header):
+        raise ValueError(
+            f"--shape-header {shape_header!r} is not a valid HTTP header name: "
+            f"letters, digits and !#$%&'*+-.^_`|~ only -- no spaces, no colon, "
+            f"and not empty.")
 
     n = names_for(prefix)
     xc = inputs["xc"]
@@ -454,7 +476,7 @@ def build_plan(inputs: dict, *, vs: str, default_pool: str = "",
     entrypoints_mapped = bool(entrypoints)
 
     # Bot Defense's egress addresses, from the infra object. These are what make
-    # the return-traffic rule trustworthy: the shape-header alone is a value any
+    # the return-traffic rule trustworthy: the guard header alone is a value any
     # client can set, so a header-only test is a bypass waiting to happen.
     egress = [ip if "/" in ip else f"{ip}/32"
               for ip in (svc.get("egress_ips") or [])]
@@ -1283,7 +1305,7 @@ def _tmsh_conditions(rule: dict, indent: str,
             # itself is the same at either event (it is fixed when the
             # connection is established), so this is not about which address
             # gets compared -- it is about when the rule can match. The rule
-            # ANDs this with `shape-header exists`, which is only knowable at
+            # ANDs this with the loop-guard `<header> exists`, only knowable at
             # request time, so pinning half of it to connection setup buys
             # nothing and would make the two halves evaluate on different
             # clocks once keep-alive and OneConnect are in play.

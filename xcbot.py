@@ -939,9 +939,13 @@ def parse_args(argv: list[str]):
     b.add_argument("--prefix", default="bot-defense",
                    help="prefix for every object name created (default: "
                         "bot-defense)")
-    b.add_argument("--shape-header", default="shape-header",
-                   help="header Bot Defense sets on traffic it hands back; the "
-                        "loop guard matches on its absence")
+    b.add_argument("--shape-header", default="shape-header", metavar="NAME",
+                   help="name of the header Bot Defense sets on traffic it "
+                        "hands back (default: shape-header). The loop guard "
+                        "matches on it, so it has to be the name your "
+                        "deployment actually sends -- a wrong name does not "
+                        "error, it just never matches, and every protected "
+                        "endpoint loops")
     b.add_argument("--inject-tag", default="head", choices=["head", "body"],
                    help="tag the telemetry <script> is appended to")
     b.add_argument("--entrypoint", action="append", metavar="PATH",

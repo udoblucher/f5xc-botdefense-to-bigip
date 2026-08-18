@@ -106,7 +106,7 @@ the logic:
 | # | Rule | Conditions | Action |
 |---|---|---|---|
 | 0 | `…-js` | path contains a value in the JS data group | → bot pool |
-| 1 | `…-return` | `shape-header` exists **and** client address in the egress data group | *none* |
+| 1 | `…-return` | the guard header exists **and** client address in the egress data group | *none* |
 | 2+ | `…-endpoints-*` | method + path *op* a value in an endpoint data group | → bot pool (fallback: app pool) |
 | — | | nothing matched | → the VS's own pool |
 
@@ -129,14 +129,25 @@ What you want is *"steer to the bot pool unless the request comes from an egress
 address **and** carries the header"* — a NAND. An LTM rule can only AND its
 conditions, so the positive case is matched here and stopped instead.
 
-Both halves matter. `shape-header` is just a header and any client can set one,
-so a header-only guard means a crafted request skips Bot Defense entirely.
+Both halves matter. The guard header is just a header and any client can set
+one, so a header-only guard means a crafted request skips Bot Defense entirely.
 Requiring an egress address too closes that: forging the header is not enough,
 you would also have to originate from Bot Defense's network. The addresses come
 from the Bot Infrastructure object (`spec.cloud_hosted.egress[].ip_address`) and
 land in an `ip`-type data group. If the infra advertises none, the tool falls
-back to testing `shape-header` absence on each endpoint rule and warns that the
+back to testing the header's absence on each endpoint rule and warns that the
 guard is weaker.
+
+**The header's name is `--shape-header`, and `shape-header` is only the
+default.** Nothing `fetch` reads carries it — not the Bot Endpoint Policy, not
+the Bot Infrastructure object — so the tool cannot derive it, and it is one of
+the few values in the build that has to come from you if your deployment
+differs. Nothing downstream hardcodes it: whatever you pass
+lands in the policy condition, the GUI walkthrough, the AS3 declaration and the
+generated prose alike. It is also the one wrong value that fails *silently* —
+a name the service never sends does not error, rule 1 simply never matches,
+and every protected endpoint loops between the BIG-IP and Bot Defense. Confirm
+it against a real response before you attach the policy.
 
 The rule carries **no action**, which is how "let it through to the application"
 is expressed: under `first-match` it matches, evaluation ends, and the request
@@ -158,7 +169,7 @@ quietly routes to the old origin.
 #### Rules 2+ — the protected endpoints
 
 One rule per endpoint data group, each forwarding to the bot pool with the app
-pool as its `fallback-pool`. They carry no `shape-header` condition of their own —
+pool as its `fallback-pool`. They carry no header condition of their own —
 rule 1 already handled return traffic, and testing the header here as well would
 be the spoofable form of the same check. See
 [Why one data group per method *and operator*](#objects-created) below for how
@@ -580,6 +591,11 @@ previous values that non-endpoint drift is compared against. `--prefix`,
 `--partition` and `--merge-ops` must match what `build` was run with, or the
 names it looks for are not the names on the box.
 
+`--shape-header` deliberately has no counterpart here. `sync` compares
+data-group *records*, and the header name is a policy condition — it changes no
+object name and appears in nothing `sync` reads or writes. A deployment using a
+custom header syncs with the same command as one using the default.
+
 ### What is staged, and what is only reported
 
 `_endpoint_buckets()` groups endpoints by (method, operator, case sensitivity,
@@ -691,7 +707,7 @@ drifting apart. Add a decision there, never in a renderer.
 | `--merge-ops` | one data group + rule per method, at the cost of fidelity (see above) |
 | `--oneconnect-mask` | OneConnect source mask (default `255.255.255.255`; `""` skips the profile) |
 | `--prefix` | prefix for every object name (default `bot-defense`) |
-| `--shape-header` | the loop-guard header name (default `shape-header`) |
+| `--shape-header` | name of the header Bot Defense sets on returned traffic, which the loop guard matches on (default `shape-header`). Set it if your deployment sends a different one — a wrong name does not error, it just never matches |
 | `--inject-tag` | `head` or `body` |
 | `--inputs` | inputs file to build from (default `botdefense_inputs.json`) |
 | `--out-dir` | default `out/` |

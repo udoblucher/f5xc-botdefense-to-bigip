@@ -231,6 +231,32 @@ check("record differences point at sync rather than being applied",
       "sync --check" in SCRIPT, True)
 
 # ---------------------------------------------------------------------------
+# The loop-guard header is a parameter, not a constant
+# ---------------------------------------------------------------------------
+# It is the service's name to choose, so a deployment that sends something else
+# has to be buildable. The check that matters is that the value reaches the
+# rendered policy: the default being right for most tenants is exactly what
+# would hide a renderer that hardcoded it.
+custom = render_tmsh(plan_for(shape_header="x-my-bot-header"))
+check("a custom header name reaches the policy condition",
+      "name x-my-bot-header" in custom, True)
+check("...and the default is nowhere in that build",
+      "shape-header" in custom, False)
+check("the default is still the default",
+      "name shape-header" in SCRIPT, True)
+# Written unquoted into `name <hdr>`, so a space would parse as another tmsh
+# keyword and an empty value would drop the condition's name -- neither shows
+# up until `load sys config merge` runs, on a box.
+for bad in ("", "   ", "x-my header", "x-my-header:", "x-my-header\nfoo"):
+    try:
+        plan_for(shape_header=bad)
+    except ValueError:
+        pass
+    else:
+        FAILURES.append(f"header name {bad!r} was accepted\n"
+                        f"     got: no error\n    want: ValueError")
+
+# ---------------------------------------------------------------------------
 if FAILURES:
     print(f"{len(FAILURES)} FAILED\n")
     for f in FAILURES:

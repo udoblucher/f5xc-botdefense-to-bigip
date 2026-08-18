@@ -13,6 +13,11 @@
 #   /login /search     your own protected paths
 #   secureapp          your virtual server
 #   /Common/app-pool   the pool secureapp already uses
+#   shape-header       the header your Bot Defense deployment sets on traffic
+#                      it hands back. Step 8's loop guard matches on it, and a
+#                      wrong name does not error -- the rule just never
+#                      matches, and every protected endpoint loops. Confirm it
+#                      against your deployment rather than assuming the default.
 #
 # Order matters. Steps 1-8 only create objects; live traffic is untouched
 # until step 9 attaches them to the virtual server.
@@ -105,6 +110,11 @@ create ltm profile one-connect bot-defense-oneconnect defaults-from oneconnect s
 # matched request goes if the Bot Defense pool is down. Replace
 # /Common/app-pool with yours, or delete those two lines to let a matched
 # request fail when the pool is down.
+#
+# The bot-defense-return rule below reads `name shape-header`. That is the
+# default name only; put your deployment's own header there. It is written
+# unquoted, so it takes an HTTP header name and nothing else -- no spaces,
+# no trailing colon.
 #
 # Merged rather than created inline because the rules nest. In bash:
 #

@@ -118,6 +118,23 @@ created inside it:
 python3 xcbot.py build --partition prod --vs shop     # or just: --vs /prod/shop
 ```
 
+If your Bot Defense deployment marks returned traffic with a header other than
+`shape-header`, name it — the loop guard is the rule that matches on it:
+
+```bash
+python3 xcbot.py build --vs secureapp --entrypoint /login \
+--shape-header x-my-bot-header
+```
+
+The default suits most deployments and XC does not publish the name anywhere
+`fetch` can read, so this is one of the few values you have to supply yourself.
+It is worth getting right, because a wrong name is the one mistake here that
+does not announce itself: nothing fails at build or apply time, the guard rule
+simply never matches, and every protected endpoint then loops between the
+BIG-IP and the service. That surfaces in step 8 as a hang, and the fix is to
+rebuild with the right name — so if you are unsure, ask before you apply rather
+than after.
+
 Add `--bigip bigip.example.com --bigip-user admin` to turn `--vs` into a
 pick-list of real virtual servers, pre-fill the fallback pool, and get warned
 about name collisions and about existing iRules that would defeat the policy.
@@ -225,8 +242,13 @@ Anything else logs `is NOT an Entrypoint`. Then check:
 1. **The script is actually in the HTML** — `curl -s https://app/login | grep -i script`.
 2. **Protected endpoints do not hang.** A hang means the loop guard is not
    matching; see the Rule 1 note in
-   [README](README.md#rule-1--the-loop-guard). First thing to check is a SNAT
-   between Bot Defense and the VS.
+   [README](README.md#rule-1--the-loop-guard). The guard needs both halves, so
+   check both: a SNAT between Bot Defense and the VS, and the header name. They
+   look identical from here. For the header, capture what actually arrives on
+   the second visit — `tcpdump -ni 0.0 -s0 -A port 443` on the box, or a
+   temporary `log local0. "[HTTP::header names]"` in an iRule — and compare it
+   to what you built with. If it differs, rebuild with `--shape-header <name>`;
+   nothing else in the object set changes.
 3. **The bot pool is up** — `tmsh show ltm pool bot-defense-pool`. Down means
    DNS or egress 443, in that order.
 
