@@ -31,6 +31,10 @@ blog/
 # Local presentation material. Not part of the tool.
 site/
 
+# Source material for the deck's connector slides. F5-authored, and its examples
+# are real hosts and a real demo application -- not ours to republish.
+F5XC-Bot-Defense-Standard-POC-Guide-Big-IP-connector-iApp.*
+
 # Local tooling state: machine addresses and shell history.
 .claude/settings.local.json
 
