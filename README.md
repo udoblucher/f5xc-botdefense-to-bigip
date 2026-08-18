@@ -6,6 +6,7 @@ it into whichever form of BIG-IP configuration you need:
 1. **Step-by-step GUI instructions** with every field value filled in
 2. **tmsh commands**, numbered by step, as a runnable script
 3. **An AS3 declaration** for automation
+4. **A FAST template** for the shops that deploy from a form
 
 ```bash
 python3 xcbot.py fetch --tenant acme          # creates xc_api_token.txt, then
@@ -64,10 +65,12 @@ what XC actually said.
   XC API ──fetch──▶ botdefense_inputs.json ──build──▶ out/<vs>_botdefense_ui.md
                      (commit this)                    out/<vs>_botdefense.sh
                                                       out/<vs>_botdefense_as3.json
+                                                      out/<vs>_botdefense_fast.yaml
                                                       out/<irule>.tcl
 ```
 
-Pick a subset with `--ui`, `--tmsh`, `--as3`; the default is all of them.
+Pick a subset with `--ui`, `--tmsh`, `--as3`, `--fast`; the default is all of
+them.
 
 Two optional extras: **`deploy`** pushes an artifact you have already reviewed,
 and **`sync`** tells you when the XC policy has moved since you built from it.
@@ -564,6 +567,43 @@ pool.
 - AS3 must be installed on the target (`/mgmt/shared/appsvcs/info`). `deploy`
   checks and tells you if it is not.
 
+### The FAST template
+
+`--fast` writes `out/<vs>_botdefense_fast.yaml`: **the same declaration as
+`--as3`**, with the values a redeploy is likely to change lifted out as form
+fields. Install it once as a template set and a BIG-IP admin deploys from the
+FAST tab without seeing JSON.
+
+It is not a second implementation. `render_fast()` runs `render_as3()` over a
+copy of the plan whose parameterised values are sentinels, then swaps those for
+Mustache tags — so there is one place where AS3 objects are built, and
+`test_tmsh.py` substitutes the template's own defaults back in and asserts the
+result *is* the AS3 declaration.
+
+Up to ten fields: the tenant, the service host and port, the monitor's Host
+header, interval and timeout, the loop-guard header name, the JavaScript path,
+the `<script>` src, and the OneConnect mask. Only the ones the template body
+actually uses are declared — build with `--oneconnect-mask ""` and the mask is
+not offered, because a field that changes nothing is worse than a missing one.
+
+**What is not a field, and why.** The record lists — the egress addresses, the
+entrypoints, and every `…-endpoints-*` group — are literal. AS3 wants each
+record as a `{key, value}` object; FAST does not support objects inside a form
+array, and a Mustache section cannot emit the commas between them. So the
+template's *shape* is the XC policy it was generated from. Reuse it for another
+host, partition or header; regenerate it when the endpoint mix changes. That is
+the contract the other three artifacts already have.
+
+Two more things it inherits from AS3: it attaches nothing to the virtual
+server, and with a named partition AS3 still takes ownership of the whole
+tenant. The template's header comment repeats both, plus the upload and
+`POST /mgmt/shared/fast/templatesets` commands.
+
+`deploy` does not push it. Installing a template set is a zip upload, a
+template-set POST and then an application POST — three endpoints and an
+archive format the tool does not do yet. Build it, then install it with the
+commands in its header.
+
 ---
 
 ## Keeping up with XC
@@ -707,6 +747,7 @@ drifting apart. Add a decision there, never in a renderer.
 | `--merge-ops` | one data group + rule per method, at the cost of fidelity (see above) |
 | `--oneconnect-mask` | OneConnect source mask (default `255.255.255.255`; `""` skips the profile) |
 | `--prefix` | prefix for every object name (default `bot-defense`) |
+| `--fast` | write a FAST template as well (default: every artifact) |
 | `--shape-header` | name of the header Bot Defense sets on returned traffic, which the loop guard matches on (default `shape-header`). Set it if your deployment sends a different one — a wrong name does not error, it just never matches |
 | `--inject-tag` | `head` or `body` |
 | `--inputs` | inputs file to build from (default `botdefense_inputs.json`) |

@@ -15,13 +15,16 @@ test that needed it could not run for anyone else.
 
 from __future__ import annotations
 
+import difflib
+import json
 import re
 import subprocess
 import sys
 import tempfile
 
-from render import (FALLBACK_TOKEN, build_plan, fingerprint, fingerprints,
-                    names_for, render_tmsh)
+from render import (FALLBACK_TOKEN, FAST_VARS, build_plan, fingerprint,
+                    fingerprints, names_for, render_as3, render_fast,
+                    render_tmsh)
 
 FAILURES = []
 
@@ -255,6 +258,97 @@ for bad in ("", "   ", "x-my header", "x-my-header:", "x-my-header\nfoo"):
     else:
         FAILURES.append(f"header name {bad!r} was accepted\n"
                         f"     got: no error\n    want: ValueError")
+
+
+# ---------------------------------------------------------------------------
+# The FAST template renders back to the AS3 declaration
+# ---------------------------------------------------------------------------
+# render_fast() does not build its own objects -- it runs render_as3() over a
+# plan whose parameterised values are sentinels. This is the test that keeps
+# that true: substitute the template's own default values back into its own
+# template body and the result has to be the AS3 artifact, byte for byte,
+# except where the difference is deliberate. Add an object to render_as3 and
+# it appears in both; parameterise something without a default and this fails.
+FAST = render_fast(PLAN)
+
+_head, _sep, _tmpl = FAST.partition("template: |\n")
+check("the template has a block scalar to read", bool(_sep), True)
+
+# Defaults come out of the emitted YAML, not out of _fast_default() -- the
+# point is that the file is self-consistent, not that one function agrees with
+# itself.
+_defaults = {k: json.loads(v) for k, v in re.findall(
+    r"^  (\w+):$(?:\n    .*)*?\n    default: (.*)$", _head, re.M)}
+check("every variable has a default in definitions",
+      sorted(_defaults), sorted(n for n, *_ in FAST_VARS))
+
+_body = "\n".join(ln[2:] if ln.startswith("  ") else ln
+                  for ln in _tmpl.splitlines())
+for _name, _kind, *_rest in FAST_VARS:
+    _v = _defaults[_name]
+    if _kind == "integer":
+        # Unquoted in the template, so the rendered JSON gets a number.
+        check(f"{_name} is annotated ::integer",
+              "{{%s::integer}}" % _name in _body, True)
+        _body = _body.replace("{{%s::integer}}" % _name, str(int(_v)))
+    else:
+        _body = _body.replace("{{%s}}" % _name, json.dumps(_v)[1:-1])
+
+check("no mustache tag is left unaccounted for",
+      re.findall(r"\{\{.*?\}\}", _body), [])
+
+_got = json.loads(_body)                       # also asserts it is valid JSON
+_want = json.loads(render_as3(PLAN))["declaration"]
+
+# The one deliberate difference. `purpose` becomes an AS3 remark truncated to
+# 64 characters; naming the header there would both go stale the moment
+# somebody changes the field and risk a {{tag}} being cut in half, which would
+# render as nothing. So the FAST variant describes the header instead.
+_dg = N["dg_egress"]
+_tenant = "Common"
+check("the egress remark names the header in AS3",
+      "shape-header" in _want[_tenant]["Shared"][_dg]["remark"], True)
+check("...and describes it instead in FAST",
+      "loop-guard" in _got[_tenant]["Shared"][_dg]["remark"], True)
+_got[_tenant]["Shared"][_dg]["remark"] = _want[_tenant]["Shared"][_dg]["remark"]
+
+# Compared as a diff, not as two dicts: these are ~200-line declarations and
+# check() prints both sides, so an equality failure here would bury the one
+# line that changed under everything that did not.
+_diff = [ln for ln in difflib.unified_diff(
+    json.dumps(_want, indent=2, sort_keys=True).splitlines(),
+    json.dumps(_got, indent=2, sort_keys=True).splitlines(),
+    "as3", "fast", lineterm="", n=0) if not ln.startswith("@@")]
+check("the rendered template IS the AS3 declaration",
+      [ln[:110] for ln in _diff[2:12]], [])
+
+# The iRule names the entrypoint data group by full path, and the path carries
+# the tenant -- so the body differs per rendering and the fingerprint comment
+# inside it can only be right for one of them. It has to be right for the
+# default rendering, or a FAST deployment and a tmsh deployment of identical
+# TCL would carry different provenance markers.
+check("the iRule keeps the tenant parameterised",
+      "/{{tenant_name}}/Shared/" in _tmpl, True)
+
+check("the template says which lists are not fields",
+      "WHAT IS A FIELD AND WHAT IS NOT" in _head, True)
+check("the template carries the XC policy version it came from",
+      f"v{PLAN['meta']['version']}" in _head, True)
+
+# A custom header has to reach the FAST defaults too, or the form pre-fills the
+# wrong name and the guard rule silently never matches.
+check("a custom --shape-header reaches the template default",
+      '"x-my-bot-header"' in render_fast(plan_for(shape_header="x-my-bot-header")),
+      True)
+
+# A field the template body never uses is worse than a missing one: somebody
+# sets it and wonders why the box did not change. Dropping the OneConnect
+# profile has to drop its field with it.
+_no_oc = render_fast(plan_for(oneconnect_mask=""))
+check("no OneConnect profile means no OneConnect field",
+      "oneconnect_mask" in _no_oc, False)
+check("...and the rest of the form survives it",
+      "shape_header" in _no_oc and "tenant_name" in _no_oc, True)
 
 # ---------------------------------------------------------------------------
 if FAILURES:

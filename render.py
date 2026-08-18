@@ -58,6 +58,7 @@ entrypoint list, the default pool and the name prefix come from the operator.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import hashlib
 import json
@@ -2142,3 +2143,243 @@ def render_as3(plan: dict) -> str:
         "_notes": notes,
     }
     return json.dumps(decl, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Renderer 4 -- FAST template
+# ---------------------------------------------------------------------------
+# FAST (f5-appsvcs-templates) is the layer above AS3: you install a template
+# set once, and after that a BIG-IP admin fills a form and FAST renders the AS3
+# on the box. So this renderer emits the SAME declaration renderer 3 does, with
+# the values a redeploy is likely to change lifted out as Mustache variables.
+#
+# It does not build its own object dict. It deep-copies the plan, swaps the
+# parameterised values for sentinels, and runs render_as3() over that -- so
+# there is exactly one place where AS3 objects are constructed, and the two
+# artifacts cannot drift. Add an object to render_as3 and it appears here.
+#
+# YAML rather than the .mst form. A .mst file IS the AS3 JSON, and JSON has no
+# comments, so it could not carry the generated-by line, the XC policy version
+# or the install commands that every other artifact in this tool carries. The
+# YAML form takes `definitions` (which is also what gives the GUI form its
+# field titles and types) and a `template` block scalar, and it is one file
+# instead of two. Nothing here needs a YAML library: this writes YAML, and the
+# test reads the block scalar back by indentation.
+#
+# Verified against the engine, not only the docs: @f5devcentral/f5-fast-core
+# `fast validate` accepts the output, `fast render` reproduces the --as3
+# declaration exactly, and `fast schema` derives the expected form.
+
+# Sentinels have to survive json.dumps() untouched, so: letters only, no
+# escapes, and distinctive enough that they cannot collide with a path, a
+# header name or anything else that reaches the declaration.
+def _fast_sentinel(name: str) -> str:
+    return "xcbotFastVar" + name.title().replace("_", "") + "End"
+
+
+# (name, type, title, description). `type` drives both the Mustache annotation
+# and the schema FAST derives for the form.
+FAST_VARS = [
+    ("tenant_name", "string", "BIG-IP partition (AS3 tenant)",
+     "The partition the objects are created in. AS3 owns every tenant it "
+     "deploys except /Common, so a named partition here must already be "
+     "AS3-managed."),
+    ("bot_service_host", "string", "Bot Defense service host",
+     "The FQDN the Bot Defense service answers on, from the Bot "
+     "Infrastructure object. Used for the pool member and for the health "
+     "monitor's Host header."),
+    ("bot_service_port", "integer", "Bot Defense service port",
+     "Normally 443."),
+    ("monitor_host", "string", "Health monitor Host header",
+     "The name the health check asks for /health under. Often the service "
+     "host, but not always -- the Bot Infrastructure object carries the two "
+     "separately, so this is its own field."),
+    ("shape_header", "string", "Loop-guard header name",
+     "The header Bot Defense sets on traffic it hands back. A wrong name "
+     "does not error -- the guard rule simply never matches, and every "
+     "protected endpoint loops."),
+    ("js_path", "string", "Telemetry JavaScript path",
+     "The path the service serves the client script on. Requests for it go "
+     "to the service, not to the application."),
+    ("script_src", "string", "Telemetry <script> src",
+     "The src attribute injected into entrypoint pages. Usually the "
+     "JavaScript path with the query string the console gives you."),
+    ("oneconnect_mask", "string", "OneConnect source mask",
+     "255.255.255.255 confines serverside connection reuse to one client "
+     "address."),
+    ("monitor_interval", "integer", "Health monitor interval (s)", ""),
+    ("monitor_timeout", "integer", "Health monitor timeout (s)", ""),
+]
+_FAST_TYPES = {name: kind for name, kind, _t, _d in FAST_VARS}
+
+
+# The Host header inside the monitor's send string, where the CRLF is the two
+# literal characters backslash-r, not a newline.
+_MON_HOST = re.compile(r"host: (.*?)\\r\\n")
+
+
+def _monitor_host(plan: dict) -> str:
+    mo = _MON_HOST.search(plan["monitor"]["send"])
+    return mo.group(1) if mo else ""
+
+
+def _fast_plan(plan: dict) -> dict:
+    """The plan with every parameterised value replaced by its sentinel."""
+    S = {name: _fast_sentinel(name) for name, *_ in FAST_VARS}
+    p = copy.deepcopy(plan)
+
+    p["pool"]["host"] = S["bot_service_host"]
+    # The Host header the monitor sends is its own value, not the pool member's
+    # name: XC carries the two separately and they do differ in practice.
+    # Leaving it literal would give you a form that changes the service host
+    # and goes on health-checking the old one.
+    if _monitor_host(plan):
+        p["monitor"]["send"] = p["monitor"]["send"].replace(
+            _monitor_host(plan), S["monitor_host"])
+    p["pool"]["port"] = S["bot_service_port"]
+    p["monitor"]["interval"] = S["monitor_interval"]
+    p["monitor"]["timeout"] = S["monitor_timeout"]
+    p["partition"] = S["tenant_name"]
+    p["shape_header"] = S["shape_header"]
+    p["html_rule"]["content"] = f'<script src="{S["script_src"]}"></script>'
+    if p["oneconnect"]:
+        p["oneconnect"]["source_mask"] = S["oneconnect_mask"]
+
+    # The conditions were built in build_plan with the real header baked in, so
+    # setting plan["shape_header"] alone would leave the policy naming the old
+    # one. Both kinds, because the header-absent form is what a no-egress
+    # deployment gets.
+    for r in p["policy"]["rules"]:
+        for c in r["conditions"]:
+            if c["kind"] in ("header-absent", "header-exists"):
+                c["name"] = S["shape_header"]
+
+    for dg in p["datagroups"]:
+        if dg["name"] == p["names"]["dg_js"]:
+            dg["records"] = [(S["js_path"], "")]
+        # `purpose` becomes an AS3 remark truncated to 64 characters. A
+        # {{tag}} in there could be cut in half and would then render as
+        # nothing, so the header is described rather than named.
+        if plan["shape_header"] in dg["purpose"]:
+            dg["purpose"] = dg["purpose"].replace(
+                plan["shape_header"], "loop-guard")
+    return p
+
+
+def render_fast(plan: dict) -> str:
+    """A FAST template set entry: the AS3 of renderer 3, parameterised."""
+    m, n = plan["meta"], plan["names"]
+    decl = json.loads(render_as3(_fast_plan(plan)))["declaration"]
+
+    # The iRule carries its own `xcbot-fingerprint` comment, hashed over its
+    # own body -- and the body names the entrypoint data group by full path,
+    # which contains the tenant. Rendered off the sentinel plan the hash would
+    # be of a body containing the sentinel, so it would not match the iRule the
+    # tmsh and AS3 artifacts write even though the TCL is byte-identical. Take
+    # the real one and re-parameterise just the path, so the fingerprint is
+    # right for the declaration this template renders at its defaults.
+    #
+    # Change tenant_name in the form and the comment goes stale. That is a
+    # comment, and the failure it can cause is the safe one: a later tmsh run
+    # reports "exists, but does not match this build" and stops without
+    # touching the object.
+    real = json.loads(render_as3(plan))["declaration"]
+    real_tenant = _fast_default(plan, "tenant_name")
+    decl[_fast_sentinel("tenant_name")]["Shared"][n["irule"]]["iRule"] = (
+        real[real_tenant]["Shared"][n["irule"]]["iRule"].replace(
+            f"/{real_tenant}/Shared/{n['dg_entry']}",
+            f"/{_fast_sentinel('tenant_name')}/Shared/{n['dg_entry']}"))
+
+    body = json.dumps(decl, indent=2)
+
+    for name, kind, _t, _d in FAST_VARS:
+        sent = _fast_sentinel(name)
+        if kind == "integer":
+            # Quoted in the dump because the sentinel is a string; the quotes
+            # come off with it so the rendered JSON gets a number.
+            body = body.replace(f'"{sent}"', f"{{{{{name}::integer}}}}")
+        else:
+            # Left unquoted on purpose: the sentinel sits inside a JSON string
+            # already, whether it is the whole value or part of one.
+            body = body.replace(sent, f"{{{{{name}}}}}")
+
+    unresolved = sorted(set(re.findall(r"xcbotFastVar\w+End", body)))
+    if unresolved:
+        raise RuntimeError(
+            f"FAST template still carries sentinels with no variable: "
+            f"{', '.join(unresolved)}. A value was substituted in _fast_plan "
+            f"without a matching FAST_VARS entry.")
+
+    L = [
+        "# FAST template -- F5 Bot Defense steering for the virtual server "
+        f"{plan['vs']}.",
+        f"# Generated by xcbot.py -- {m['generated']}",
+        f"# Source: XC {m['namespace']}/{m['policy']} v{m['version']} "
+        f"(infra {m['infra']})",
+        "#",
+        "# Renders the same AS3 declaration as the --as3 artifact, with the",
+        "# values below exposed as form fields. Install it as a template set:",
+        "#",
+        "#   mkdir -p xcbot && cp <this file> xcbot/botdefense.yaml",
+        "#   zip -r xcbot.zip xcbot",
+        "#   curl -sku admin:PASS https://BIGIP/mgmt/shared/file-transfer/uploads/xcbot.zip \\",
+        "#        -H 'Content-Type: application/octet-stream' \\",
+        "#        -H \"Content-Range: 0-$(($(wc -c <xcbot.zip)-1))/$(wc -c <xcbot.zip)\" \\",
+        "#        --data-binary @xcbot.zip",
+        "#   curl -sku admin:PASS https://BIGIP/mgmt/shared/fast/templatesets \\",
+        "#        -H 'Content-Type: application/json' -d '{\"name\": \"xcbot\"}'",
+        "#",
+        "# WHAT IS A FIELD AND WHAT IS NOT. The record lists below -- the egress",
+        "# addresses, the entrypoints and every …-endpoints-* group -- are",
+        "# literal, not variables. AS3 wants each record as a {key, value}",
+        "# object, FAST does not support objects inside a form array, and a",
+        "# Mustache section cannot emit the commas between them. So this",
+        "# template's SHAPE is the XC policy it was generated from: reuse it for",
+        "# another host, partition or header, and regenerate it when the",
+        "# endpoint mix changes. That is the same contract the other three",
+        "# artifacts already have.",
+        "#",
+        "# This template does NOT attach anything to a virtual server, for the",
+        f"# same reason the AS3 artifact does not: {plan['vs']} is not",
+        "# AS3-managed. Attach with STEP 8 of the tmsh artifact.",
+        "",
+        "definitions:",
+    ]
+    # Only the variables the body actually uses. --oneconnect-mask "" drops the
+    # profile altogether, and a form field that changes nothing is worse than a
+    # missing one: somebody sets it and wonders why the box did not change.
+    used = [v for v in FAST_VARS if ("{{%s}}" % v[0]) in body
+            or ("{{%s::%s}}" % (v[0], v[1])) in body]
+    for name, kind, title, desc in used:
+        L.append(f"  {name}:")
+        L.append(f"    title: {json.dumps(title)}")
+        if desc:
+            L.append(f"    description: {json.dumps(desc)}")
+        L.append(f"    type: {kind}")
+        L.append(f"    default: {json.dumps(_fast_default(plan, name))}")
+    if not used:
+        L.append("  {}")
+    L.append("template: |")
+    L += ["  " + ln if ln else "" for ln in body.splitlines()]
+    L.append("")
+    return "\n".join(L)
+
+
+def _fast_default(plan: dict, name: str):
+    """What this build would supply -- the form's pre-filled value."""
+    part = plan["partition"]
+    js = next((dg["records"][0][0] for dg in plan["datagroups"]
+               if dg["name"] == plan["names"]["dg_js"] and dg["records"]), "")
+    src = re.search(r'src="([^"]*)"', plan["html_rule"]["content"])
+    return {
+        "tenant_name": DEFAULT_PARTITION if part in ("", DEFAULT_PARTITION) else part,
+        "bot_service_host": plan["pool"]["host"],
+        "bot_service_port": plan["pool"]["port"],
+        "shape_header": plan["shape_header"],
+        "js_path": js,
+        "script_src": src.group(1) if src else "",
+        "oneconnect_mask": (plan["oneconnect"] or {}).get("source_mask", ""),
+        "monitor_host": _monitor_host(plan),
+        "monitor_interval": plan["monitor"]["interval"],
+        "monitor_timeout": plan["monitor"]["timeout"],
+    }[name]

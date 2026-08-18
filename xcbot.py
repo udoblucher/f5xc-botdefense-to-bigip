@@ -56,7 +56,7 @@ import xc_api
 from bigip_api import BigIP
 from rest import HTTPError
 from render import (build_plan, fingerprints, irule_selects_pool, render_as3,
-                    render_tmsh, render_ui)
+                    render_fast, render_tmsh, render_ui)
 
 DEFAULT_INPUTS = "botdefense_inputs.json"
 
@@ -508,7 +508,8 @@ def cmd_build(args) -> int:
     if bip and not args.yes:
         _collision_check(bip, plan)
 
-    want = {"ui": args.ui, "tmsh": args.tmsh, "as3": args.as3}
+    want = {"ui": args.ui, "tmsh": args.tmsh, "as3": args.as3,
+            "fast": args.fast}
     if not any(want.values()):
         want = {k: True for k in want}
 
@@ -528,6 +529,8 @@ def cmd_build(args) -> int:
         write(f"{vs}_botdefense.sh", render_tmsh(plan), 0o755)
     if want["as3"]:
         write(f"{vs}_botdefense_as3.json", render_as3(plan))
+    if want["fast"]:
+        write(f"{vs}_botdefense_fast.yaml", render_fast(plan))
     if want["ui"] or want["tmsh"]:
         write(f"{plan['irule']['name']}.tcl", plan["irule"]["text"])
 
@@ -979,6 +982,11 @@ def parse_args(argv: list[str]):
     b.add_argument("--ui", action="store_true", help="write the GUI walkthrough")
     b.add_argument("--tmsh", action="store_true", help="write the tmsh script")
     b.add_argument("--as3", action="store_true", help="write the AS3 declaration")
+    b.add_argument("--fast", action="store_true",
+                   help="write a FAST template: the same AS3 declaration "
+                        "with the host, port, partition, header name and "
+                        "script path as form fields, for installing as a "
+                        "template set and deploying from the FAST tab")
     bigip_opts(b)
     b.add_argument("--yes", "-y", action="store_true",
                    help="never prompt; every answer must come from an option")

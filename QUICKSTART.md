@@ -40,6 +40,7 @@ iRules](README.md#coexisting-with-existing-irules).
 | Egress | Outbound 443 from the BIG-IP to that service host. |
 | Version | Verified on **17.5.1**. Everything generated (LTM policies, data groups, HTML profiles, OneConnect) is long-standing LTM, but 17.5.1 is the only version this has been run against. |
 | For AS3 only | AS3 installed, 3.54.0 or newer. Skip if you use the GUI or tmsh output. |
+| For FAST only | FAST (`f5-appsvcs-templates`) installed, plus AS3 — FAST renders the declaration and hands it to AS3. Skip unless you deploy from the FAST tab. |
 
 ---
 
@@ -140,16 +141,23 @@ pick-list of real virtual servers, pre-fill the fallback pool, and get warned
 about name collisions and about existing iRules that would defeat the policy.
 Set `BIGIP_PASS` or you will be prompted.
 
-You get four files in `out/`:
+You get five files in `out/`:
 
 | File | What it is |
 |---|---|
 | `<vs>_botdefense_ui.md` | click-by-click GUI steps, every field value filled in |
 | `<vs>_botdefense.sh` | numbered tmsh commands, runnable as-is |
 | `<vs>_botdefense_as3.json` | AS3 declaration |
+| `<vs>_botdefense_fast.yaml` | the same declaration as a FAST template, for deploying from a form |
 | `<prefix>-irule.tcl` | the iRule body on its own |
 
-`--ui`, `--tmsh`, `--as3` pick a subset.
+`--ui`, `--tmsh`, `--as3`, `--fast` pick a subset.
+
+The FAST template is for shops that would rather their BIG-IP admin filled in
+a short form than read JSON: install it once as a template set and it appears
+under the FAST tab. Its own header comment has the two `curl` commands that
+install it, and says which values are fields and which are baked in. See
+[The FAST template](README.md#the-fast-template).
 
 If you intend to configure this by hand, the `templates/` folder has both halves
 with the default object names, so there is no need to run the tool at all:
