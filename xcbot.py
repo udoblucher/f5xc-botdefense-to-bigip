@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xcbot.py -- XC Bot Defense -> BIG-IP configuration artifacts.
+"""xcbot.py -- F5 Bot Defense -> BIG-IP configuration artifacts.
 
 Two commands, in the order you use them:
 

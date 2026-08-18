@@ -12,7 +12,7 @@ drift apart. Add a decision to build_plan, never to a renderer.
 
 THE DESIGN BEING GENERATED
 --------------------------
-XC Bot Defense in REVERSE_PROXY mode is a service the BIG-IP steers traffic
+F5 Bot Defense in REVERSE_PROXY mode is a service the BIG-IP steers traffic
 into; the BIG-IP does not evaluate bot policy itself. Two independent jobs:
 
   Steering (LTM policy, first-match -- the order IS the logic)
@@ -715,7 +715,7 @@ def render_ui(plan: dict) -> str:
     m, n = plan["meta"], plan["names"]
     L = []
     A = L.append
-    A(f"# BIG-IP setup for F5 XC Bot Defense — virtual server `{plan['vs']}`")
+    A(f"# BIG-IP setup for F5 Bot Defense — virtual server `{plan['vs']}`")
     A("")
     A(f"Generated {m['generated']} by `xcbot.py` from XC data fetched {m['fetched_at']}.")
     A("")
@@ -1401,7 +1401,7 @@ def render_tmsh(plan: dict) -> str:
     A = L.append
     A("#!/bin/bash")
     A("#" + "=" * 74)
-    A("#  BIG-IP configuration for F5 XC Bot Defense")
+    A("#  BIG-IP configuration for F5 Bot Defense")
     A(f"#  Virtual server : {vsq}   (fallback pool: "
       + (plan["default_pool"] if plan["default_pool"]
          else "read off the VS at run time") + ")")
@@ -2135,7 +2135,7 @@ def render_as3(plan: dict) -> str:
             "class": "ADC",
             "schemaVersion": AS3_SCHEMA_VERSION,
             "id": f"xcbot-{plan['vs']}-{m['policy']}",
-            "label": f"F5 XC Bot Defense steering for {plan['vs']}",
+            "label": f"F5 Bot Defense steering for {plan['vs']}",
             "remark": notes[0][:64],
             tenant: {"class": "Tenant", "Shared": app},
         },

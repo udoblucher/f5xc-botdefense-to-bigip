@@ -1,4 +1,4 @@
-# BIG-IP configuration for F5 XC Bot Defense -- template for a manual build.
+# BIG-IP configuration for F5 Bot Defense -- template for a manual build.
 # Same objects xcbot.py creates, with the default object names.
 #
 # Single-line commands are written for the tmsh shell: run `tmsh`, then paste.

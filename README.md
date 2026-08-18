@@ -1,4 +1,4 @@
-# xcbot — F5 XC Bot Defense → BIG-IP configuration
+# xcbot — F5 Bot Defense → BIG-IP configuration
 
 Fetch a Bot Endpoint Policy from F5 Distributed Cloud, save it locally, and turn
 it into whichever form of BIG-IP configuration you need:
@@ -96,7 +96,7 @@ CI. So does a non-tty stdin.
 
 ## What gets generated, and why
 
-XC Bot Defense in `REVERSE_PROXY` mode is a service the BIG-IP **steers traffic
+F5 Bot Defense in `REVERSE_PROXY` mode is a service the BIG-IP **steers traffic
 into**. The BIG-IP does not evaluate bot policy itself. That splits into two
 independent jobs, which is why there is both a policy and an iRule.
 
